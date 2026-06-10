@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "exilewatch",
+  "productName": "ExileWatch",
   "version": "0.1.0",
   "identifier": "io.github.5h4rkbyt3.exilewatch",
   "build": {
@@ -12,9 +12,19 @@
   "app": {
     "windows": [
       {
-        "title": "exilewatch",
-        "width": 800,
-        "height": 600
+        "label": "main",
+        "title": "ExileWatch",
+        "width": 500,
+        "height": 680,
+        "resizable": false,
+        "fullscreen": false,
+        "decorations": false,
+        "transparent": false,
+        "alwaysOnTop": true,
+        "visible": false,
+        "skipTaskbar": true,
+        "center": true,
+        "shadow": false
       }
     ],
     "security": {

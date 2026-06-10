@@ -1,0 +1,854 @@
+<script setup lang="ts">
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
+import { invoke } from '@tauri-apps/api/core'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { openUrl } from '@tauri-apps/plugin-opener'
+
+const emit = defineEmits<{ interact: []; close: [] }>()
+
+type GameMode = 'poe1' | 'poe2'
+type BuyoutType = 'iob' | 'inperson' | 'both'
+type Rarity = 'normal' | 'magic' | 'rare' | 'unique'
+
+interface League { id: string; text: string }
+
+interface Affix {
+  id: string; text: string; value: number
+  min: number | null; max: number | null; enabled: boolean
+}
+interface Currency { id: string; label: string }
+interface Result {
+  price: number; currency: string; seller: string
+  status: 'online' | 'afk' | 'offline'; stock: number
+}
+interface ItemData {
+  name: string; base_type: string; rarity: string
+  item_level: number; influence: string; game_mode: string
+  mods: Array<{ text: string; value: number }>
+}
+
+const gameMode = ref<GameMode>('poe1')
+const buyoutType = ref<BuyoutType>('iob')
+
+const FALLBACK_LEAGUES: League[] = [
+  { id: 'Standard',  text: 'Standard' },
+  { id: 'Hardcore',  text: 'Hardcore' },
+]
+const leagues        = ref<League[]>([])
+const selectedLeague = ref('')
+const loadingLeagues = ref(false)
+
+async function loadLeagues() {
+  loadingLeagues.value = true
+  try {
+    const result = await invoke<League[]>('fetch_leagues', { gameMode: gameMode.value })
+    leagues.value = result.length ? result : FALLBACK_LEAGUES
+  } catch {
+    leagues.value = FALLBACK_LEAGUES
+  } finally {
+    loadingLeagues.value = false
+  }
+  const saved = localStorage.getItem(`${gameMode.value}_league`)
+  const match = leagues.value.find(l => l.id === saved)
+  selectedLeague.value = match ? match.id : (leagues.value[0]?.id ?? '')
+}
+
+function onLeagueChange(e: Event) {
+  const id = (e.target as HTMLSelectElement).value
+  selectedLeague.value = id
+  localStorage.setItem(`${gameMode.value}_league`, id)
+  handleInteract()
+}
+
+watch(gameMode, loadLeagues)
+
+const POE1_CURRENCIES: Currency[] = [
+  { id: 'chaos',   label: 'Chaos Orb' },
+  { id: 'divine',  label: 'Divine Orb' },
+  { id: 'exalted', label: 'Exalted Orb' },
+  { id: 'mirror',  label: 'Mirror of Kalandra' },
+  { id: 'alt',     label: 'Orb of Alteration' },
+  { id: 'fuse',    label: 'Orb of Fusing' },
+  { id: 'chrome',  label: 'Chromatic Orb' },
+]
+const POE2_CURRENCIES: Currency[] = [
+  { id: 'exalted', label: 'Exalted Orb' },
+  { id: 'divine',  label: 'Divine Orb' },
+  { id: 'chaos',   label: 'Chaos Orb' },
+  { id: 'mirror',  label: 'Mirror of Kalandra' },
+  { id: 'alt',     label: 'Orb of Alteration' },
+]
+
+const currencies = computed(() =>
+  gameMode.value === 'poe1' ? POE1_CURRENCIES : POE2_CURRENCIES
+)
+const selectedCurrency = ref('chaos')
+
+const showSettings     = ref(false)
+const sessionInput     = ref('')
+const sessionIsSet     = ref(false)
+const detectStatus     = ref<'idle' | 'busy' | 'ok' | 'err'>('idle')
+const detectError      = ref('')
+
+function toggleSettings() {
+  showSettings.value = !showSettings.value
+  if (showSettings.value) detectStatus.value = 'idle'
+  handleInteract()
+}
+
+async function autoDetect() {
+  detectStatus.value = 'busy'
+  detectError.value  = ''
+  try {
+    await invoke<string>('read_browser_session')
+    // read_browser_session auto-saves — never put the value in the input
+    sessionIsSet.value = true
+    detectStatus.value = 'ok'
+  } catch (e) {
+    detectStatus.value = 'err'
+    detectError.value  = String(e)
+  }
+}
+
+async function saveSession() {
+  const id = sessionInput.value.trim()
+  if (!id) return  // blank = keep existing token, don't clear
+  await invoke('set_session_id', { id })
+  sessionIsSet.value = true
+  sessionInput.value = ''  // clear after save — never leave token in field
+  showSettings.value = false
+}
+
+const searching = ref(false)
+
+const item = ref({
+  name: '—',
+  rarity: 'normal' as Rarity,
+  baseType: 'Hover an item, then press Alt+D',
+  itemLevel: 0,
+  influence: '',
+  affixes: [] as Affix[],
+})
+
+const results = ref<Result[]>([])
+
+const rarityClass = computed(() => `rarity-${item.value.rarity}`)
+
+const medianPrice = computed(() => {
+  if (!results.value.length) return null
+  const prices = [...results.value].map(r => r.price).sort((a, b) => a - b)
+  const mid = Math.floor(prices.length / 2)
+  return prices.length % 2 !== 0
+    ? prices[mid]
+    : Math.round((prices[mid - 1] + prices[mid]) / 2)
+})
+const medianCurrency = computed(() => results.value[0]?.currency ?? 'c')
+
+function setGameMode(mode: GameMode) {
+  selectedCurrency.value = mode === 'poe1' ? 'chaos' : 'exalted'
+  gameMode.value = mode  // triggers watch(gameMode, loadLeagues)
+}
+function formatAffix(text: string, value: number) {
+  return text.replace('#', String(value))
+}
+function handleInteract() { emit('interact') }
+
+// ── Drag to reposition ───────────────────────────────────────────────────────
+let isDragging = false
+
+function startDrag(e: MouseEvent) {
+  if (e.button !== 0) return
+  isDragging = true
+  document.documentElement.requestPointerLock()
+  emit('interact')
+}
+function onDragMove(e: MouseEvent) {
+  if (!isDragging || !document.pointerLockElement) return
+  const dx = Math.round(e.movementX), dy = Math.round(e.movementY)
+  if (dx !== 0 || dy !== 0) invoke('move_overlay', { dx, dy })
+}
+function stopDrag() {
+  if (isDragging && document.pointerLockElement) document.exitPointerLock()
+}
+function onPointerLockChange() {
+  if (!document.pointerLockElement && isDragging) {
+    isDragging = false
+    invoke('save_overlay_position')
+  }
+}
+
+// ── Lifecycle ────────────────────────────────────────────────────────────────
+const unlisteners: UnlistenFn[] = []
+
+onMounted(async () => {
+  document.addEventListener('mousemove', onDragMove)
+  document.addEventListener('mouseup', stopDrag)
+  document.addEventListener('pointerlockchange', onPointerLockChange)
+
+  loadLeagues()
+
+  invoke<string>('get_session_id').then(async id => {
+    if (id) {
+      sessionIsSet.value = true
+      return
+    }
+    // No saved session — silently try Firefox on first run
+    try {
+      await invoke<string>('read_browser_session')
+      sessionIsSet.value = true
+    } catch {
+      // Not found — user can configure via settings
+    }
+  })
+
+  unlisteners.push(await listen('search-started', () => {
+    searching.value = true
+    results.value = []
+  }))
+
+  unlisteners.push(await listen<ItemData>('item-data', ({ payload }) => {
+    searching.value = false
+    const newMode = payload.game_mode as GameMode
+    if (newMode !== gameMode.value) setGameMode(newMode)
+    item.value = {
+      name: payload.name,
+      rarity: payload.rarity as Rarity,
+      baseType: payload.base_type,
+      itemLevel: payload.item_level,
+      influence: payload.influence,
+      affixes: payload.mods.map((mod, i) => ({
+        id: String(i),
+        text: mod.text,
+        value: mod.value,
+        min: Math.floor(mod.value * 0.9),
+        max: Math.ceil(mod.value * 1.1),
+        enabled: true,
+      })),
+    }
+    results.value = []
+  }))
+})
+
+onUnmounted(() => {
+  document.removeEventListener('mousemove', onDragMove)
+  document.removeEventListener('mouseup', stopDrag)
+  document.removeEventListener('pointerlockchange', onPointerLockChange)
+  unlisteners.forEach(fn => fn())
+})
+
+async function openTradeSite() {
+  handleInteract()
+  const league = encodeURIComponent(selectedLeague.value || 'Standard')
+  const url = gameMode.value === 'poe1'
+    ? `https://www.pathofexile.com/trade/search/${league}`
+    : `https://www.pathofexile.com/trade2/search/${league}`
+  await openUrl(url)
+}
+</script>
+
+<template>
+  <div class="overlay" @mousedown="handleInteract">
+
+    <!-- ── Header ──────────────────────────────────────── -->
+    <div class="header" @mousedown="startDrag">
+      <div class="game-toggle">
+        <button
+          :class="['toggle-btn', { active: gameMode === 'poe1' }]"
+          @click.stop="setGameMode('poe1')"
+        >PoE 1</button>
+        <button
+          :class="['toggle-btn', { active: gameMode === 'poe2' }]"
+          @click.stop="setGameMode('poe2')"
+        >PoE 2</button>
+      </div>
+      <div class="header-right">
+        <button :class="['gear-btn', { active: showSettings }]" @click.stop="toggleSettings">
+          ⚙<span :class="['gear-dot', sessionIsSet ? 'gear-dot-ok' : 'gear-dot-warn']" />
+        </button>
+        <button class="close-btn" @click.stop="$emit('close')">✕</button>
+      </div>
+    </div>
+
+    <!-- ── Settings panel ───────────────────────────────── -->
+    <template v-if="showSettings">
+      <div class="settings-panel">
+        <div class="section">
+          <div class="section-title">SESSION COOKIE</div>
+
+          <div :class="['session-status', sessionIsSet ? 'status-ok' : 'status-warn']">
+            {{ sessionIsSet ? 'Session configured' : 'No session — API calls will fail' }}
+          </div>
+
+          <button
+            class="action-btn primary detect-btn"
+            :disabled="detectStatus === 'busy'"
+            @click.stop="autoDetect"
+          >{{ detectStatus === 'busy' ? 'Detecting...' : 'Detect from Firefox' }}</button>
+
+          <div v-if="detectStatus === 'ok'"  class="detect-msg detect-ok">Detected and saved</div>
+          <div v-if="detectStatus === 'err'" class="detect-msg detect-err">{{ detectError }}</div>
+
+          <div class="settings-or">— or enter manually —</div>
+
+          <input
+            type="password"
+            class="session-input"
+            v-model="sessionInput"
+            :placeholder="sessionIsSet ? '••••••••  (leave blank to keep current)' : 'Paste POESESSID value here'"
+            autocomplete="off"
+            spellcheck="false"
+            @click.stop
+          />
+          <p class="settings-hint">
+            Log in at pathofexile.com → F12 → Application → Cookies → POESESSID
+          </p>
+
+          <div class="settings-actions">
+            <button class="action-btn secondary" @click.stop="showSettings = false">Cancel</button>
+            <button class="action-btn primary"   @click.stop="saveSession">Save</button>
+          </div>
+        </div>
+      </div>
+    </template>
+
+    <!-- ── Main content ──────────────────────────────────── -->
+    <template v-else>
+
+    <!-- ── Item Info ───────────────────────────────────── -->
+    <div class="item-info">
+      <template v-if="searching">
+        <div class="searching-label">Searching<span class="searching-dots"></span></div>
+        <div class="item-base searching-sub">reading clipboard...</div>
+      </template>
+      <template v-else>
+        <div :class="['item-name', rarityClass]">{{ item.name }}</div>
+        <div class="item-base">{{ item.baseType }}</div>
+        <div class="item-meta">
+          <span>Item Level {{ item.itemLevel }}</span>
+          <span v-if="item.influence" class="influence">· {{ item.influence }}</span>
+        </div>
+      </template>
+    </div>
+
+    <div class="sep" />
+
+    <!-- ── Affixes ─────────────────────────────────────── -->
+    <div class="section">
+      <div class="section-title">AFFIXES</div>
+      <div class="affix-list" :class="{ 'affix-loading': searching }">
+        <label
+          v-for="affix in item.affixes"
+          v-show="!searching"
+          :key="affix.id"
+          class="affix-row"
+          @click="handleInteract"
+        >
+          <input class="affix-checkbox" type="checkbox" v-model="affix.enabled" />
+          <span :class="['affix-text', { dimmed: !affix.enabled }]">
+            {{ formatAffix(affix.text, affix.value) }}
+          </span>
+          <div class="affix-range">
+            <input
+              class="range-input"
+              type="number"
+              placeholder="min"
+              v-model.number="affix.min"
+              :disabled="!affix.enabled"
+              @focus="handleInteract"
+              @click.stop
+            />
+            <input
+              class="range-input"
+              type="number"
+              placeholder="max"
+              v-model.number="affix.max"
+              :disabled="!affix.enabled"
+              @focus="handleInteract"
+              @click.stop
+            />
+          </div>
+        </label>
+      </div>
+    </div>
+
+    <div class="sep" />
+
+    <!-- ── Search Options ─────────────────────────────── -->
+    <div class="section options-section">
+      <div class="buyout-group">
+        <button :class="['opt-btn', { active: buyoutType === 'iob' }]"      @click="buyoutType = 'iob'">Instant Buyout</button>
+        <button :class="['opt-btn', { active: buyoutType === 'inperson' }]" @click="buyoutType = 'inperson'">In Person</button>
+        <button :class="['opt-btn', { active: buyoutType === 'both' }]"     @click="buyoutType = 'both'">Both</button>
+      </div>
+      <div class="currency-row">
+        <span class="field-label">League</span>
+        <select
+          class="currency-select"
+          :value="selectedLeague"
+          :disabled="loadingLeagues"
+          :class="{ 'select-loading': loadingLeagues }"
+          @change="onLeagueChange"
+        >
+          <option v-if="loadingLeagues" value="" disabled>Loading...</option>
+          <option v-for="l in leagues" :key="l.id" :value="l.id">{{ l.text }}</option>
+        </select>
+      </div>
+      <div class="currency-row">
+        <span class="field-label">Currency</span>
+        <select class="currency-select" v-model="selectedCurrency" @change="handleInteract">
+          <option v-for="c in currencies" :key="c.id" :value="c.id">{{ c.label }}</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="sep" />
+
+    <!-- ── Actions ────────────────────────────────────── -->
+    <div class="actions">
+      <button class="action-btn primary" @click="handleInteract">Search</button>
+      <button class="action-btn secondary" @click="openTradeSite">Open Trade Site ↗</button>
+    </div>
+
+    <div class="sep" />
+
+    <!-- ── Results ────────────────────────────────────── -->
+    <div class="section results-section">
+      <div class="results-header">
+        <span class="section-title" style="margin-bottom:0">RESULTS</span>
+        <span v-if="medianPrice !== null" class="median">
+          median <span class="median-price">{{ medianPrice }}</span>
+          <span class="median-curr"> {{ medianCurrency }}</span>
+        </span>
+      </div>
+      <div class="results-list">
+        <div v-for="(r, i) in results" :key="i" class="result-row">
+          <span class="result-price">
+            {{ r.price }}<span class="result-curr"> c</span>
+          </span>
+          <span class="result-seller">{{ r.seller }}</span>
+          <span :class="['result-dot', `dot-${r.status}`]">●</span>
+          <span class="result-stock">{{ r.stock }}×</span>
+        </div>
+      </div>
+    </div>
+
+    </template><!-- end v-else main content -->
+  </div>
+</template>
+
+<style scoped>
+/* ── Overlay shell ──────────────────────────────────── */
+.overlay {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-accent);
+  border-radius: 6px;
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+/* ── Header ─────────────────────────────────────────── */
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+  cursor: grab;
+  flex-shrink: 0;
+}
+.header:active { cursor: grabbing; }
+
+.game-toggle {
+  display: flex;
+  gap: 4px;
+}
+.toggle-btn {
+  padding: 3px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.toggle-btn:hover  { border-color: var(--accent-dim); color: var(--text); }
+.toggle-btn.active { border-color: var(--accent); color: var(--accent); background: rgba(200,168,75,0.08); }
+
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.gear-btn {
+  width: 22px;
+  height: 22px;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.gear-btn:hover  { border-color: var(--accent-dim); color: var(--text); }
+.gear-btn.active { border-color: var(--accent-dim); color: var(--accent); background: rgba(200,168,75,0.08); }
+
+.gear-dot {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  pointer-events: none;
+}
+.gear-dot-ok   { background: var(--online); }
+.gear-dot-warn { background: var(--afk); }
+
+.close-btn {
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.close-btn:hover { border-color: #8b2020; color: #cc4444; background: rgba(139,32,32,0.15); }
+
+/* ── Settings panel ──────────────────────────────────── */
+.settings-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.settings-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.55;
+  margin-bottom: 10px;
+}
+.settings-hint strong { color: var(--text-label); }
+.session-input {
+  width: 100%;
+  padding: 6px 8px;
+  font-size: 11px;
+  font-family: monospace;
+  background: var(--bg-input);
+  border: 1px solid var(--border-input);
+  border-radius: 3px;
+  color: var(--text);
+  outline: none;
+  margin-bottom: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.session-input:focus { border-color: var(--accent-dim); }
+.settings-actions { display: flex; gap: 8px; }
+
+.session-status {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  padding: 4px 0 10px;
+}
+.status-ok   { color: var(--online); }
+.status-warn { color: var(--afk); }
+
+.detect-btn { width: 100%; margin-bottom: 6px; }
+
+.detect-msg {
+  font-size: 11px;
+  margin-bottom: 8px;
+}
+.detect-ok  { color: var(--online); }
+.detect-err { color: #cc4444; line-height: 1.4; }
+
+.settings-or {
+  font-size: 10px;
+  color: var(--text-muted);
+  text-align: center;
+  letter-spacing: 0.06em;
+  margin: 8px 0;
+}
+
+/* ── Item Info ───────────────────────────────────────── */
+.item-info {
+  padding: 12px 16px 10px;
+  flex-shrink: 0;
+}
+.item-name {
+  font-size: 17px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  line-height: 1.2;
+}
+.rarity-rare   { color: var(--rare); text-shadow: 0 0 12px rgba(255,215,0,0.3); }
+.rarity-magic  { color: var(--magic); }
+.rarity-unique { color: var(--unique); }
+.rarity-normal { color: var(--normal); }
+
+.item-base {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+.item-meta {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 4px;
+}
+.influence { color: var(--currency); }
+
+/* ── Separator ───────────────────────────────────────── */
+.sep {
+  height: 1px;
+  background: var(--border);
+  flex-shrink: 0;
+}
+
+/* ── Section ─────────────────────────────────────────── */
+.section {
+  padding: 8px 14px;
+  flex-shrink: 0;
+}
+.section-title {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  color: var(--text-label);
+  margin-bottom: 6px;
+}
+
+/* ── Affixes ─────────────────────────────────────────── */
+.affix-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: 220px;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+.affix-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  border-radius: 3px;
+  cursor: pointer;
+  transition: background 0.1s;
+}
+.affix-row:hover { background: var(--bg-hover); }
+
+.affix-checkbox {
+  width: 13px;
+  height: 13px;
+  flex-shrink: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.affix-text {
+  flex: 1;
+  font-size: 12px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: color 0.15s;
+}
+.affix-text.dimmed { color: var(--text-muted); }
+
+.affix-range {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+.range-input {
+  width: 48px;
+  padding: 2px 5px;
+  font-size: 11px;
+  text-align: center;
+  background: var(--bg-input);
+  border: 1px solid var(--border-input);
+  border-radius: 3px;
+  color: var(--text);
+  outline: none;
+  transition: border-color 0.15s;
+  -moz-appearance: textfield;
+}
+.range-input::-webkit-inner-spin-button,
+.range-input::-webkit-outer-spin-button { -webkit-appearance: none; }
+.range-input:focus   { border-color: var(--accent-dim); }
+.range-input:disabled { color: var(--text-muted); cursor: not-allowed; }
+
+/* ── Options ─────────────────────────────────────────── */
+.options-section { display: flex; flex-direction: column; gap: 8px; }
+
+.buyout-group { display: flex; gap: 4px; }
+.opt-btn {
+  flex: 1;
+  padding: 5px 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.opt-btn:hover  { border-color: var(--accent-dim); color: var(--text); }
+.opt-btn.active { border-color: var(--accent); color: var(--accent); background: rgba(200,168,75,0.1); }
+
+.currency-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.field-label { font-size: 11px; color: var(--text-label); white-space: nowrap; }
+.currency-select {
+  flex: 1;
+  padding: 4px 8px;
+  font-size: 12px;
+  background: var(--bg-input);
+  border: 1px solid var(--border-input);
+  border-radius: 3px;
+  color: var(--currency);
+  outline: none;
+  cursor: pointer;
+  appearance: auto;
+}
+.currency-select:focus { border-color: var(--accent-dim); }
+.select-loading { opacity: 0.5; cursor: not-allowed; }
+
+/* ── Actions ─────────────────────────────────────────── */
+.actions {
+  display: flex;
+  gap: 8px;
+  padding: 8px 14px;
+  flex-shrink: 0;
+}
+.action-btn {
+  flex: 1;
+  padding: 7px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  border-radius: 3px;
+  cursor: pointer;
+  transition: all 0.15s;
+  border: 1px solid;
+}
+.action-btn.primary {
+  background: rgba(200,168,75,0.15);
+  border-color: var(--accent-dim);
+  color: var(--accent);
+}
+.action-btn.primary:hover {
+  background: rgba(200,168,75,0.25);
+  border-color: var(--accent);
+}
+.action-btn.secondary {
+  background: var(--bg-input);
+  border-color: var(--border);
+  color: var(--text-muted);
+}
+.action-btn.secondary:hover {
+  border-color: var(--accent-dim);
+  color: var(--text);
+}
+
+/* ── Results ─────────────────────────────────────────── */
+.results-section {
+  flex: 1;
+  min-height: 0; /* required for flex children to scroll */
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.results-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+.median { font-size: 11px; color: var(--text-muted); }
+.median-price { color: var(--currency); font-weight: 700; }
+.median-curr  { font-size: 10px; }
+
+.results-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.result-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 6px;
+  border-radius: 3px;
+  font-size: 12px;
+  transition: background 0.1s;
+}
+.result-row:hover { background: var(--bg-hover); }
+
+.result-price { font-weight: 700; color: var(--currency); white-space: nowrap; min-width: 40px; }
+.result-curr  { font-weight: 400; font-size: 10px; color: var(--text-muted); }
+.result-seller { flex: 1; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.result-dot { font-size: 9px; flex-shrink: 0; }
+.dot-online  { color: var(--online); }
+.dot-afk     { color: var(--afk); }
+.dot-offline { color: var(--offline); }
+.result-stock { font-size: 11px; color: var(--text-muted); flex-shrink: 0; min-width: 22px; text-align: right; }
+
+/* ── Loading state ───────────────────────────────────── */
+.searching-label {
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--text-label);
+  letter-spacing: 0.03em;
+}
+.searching-sub {
+  color: var(--text-muted);
+  font-style: italic;
+}
+.searching-dots::after {
+  content: '';
+  animation: dots 1.4s steps(4, end) infinite;
+}
+@keyframes dots {
+  0%   { content: ''; }
+  25%  { content: '.'; }
+  50%  { content: '..'; }
+  75%  { content: '...'; }
+  100% { content: ''; }
+}
+.affix-loading {
+  min-height: 32px;
+  opacity: 0.3;
+}
+</style>
