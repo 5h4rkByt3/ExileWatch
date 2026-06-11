@@ -14,8 +14,8 @@
       {
         "label": "main",
         "title": "ExileWatch",
-        "width": 500,
-        "height": 680,
+        "width": 450,
+        "height": 850,
         "resizable": false,
         "fullscreen": false,
         "decorations": false,

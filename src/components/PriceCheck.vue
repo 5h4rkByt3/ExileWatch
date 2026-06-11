@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { openUrl } from '@tauri-apps/plugin-opener'
@@ -8,7 +8,7 @@ const emit = defineEmits<{ interact: []; close: [] }>()
 
 type GameMode = 'poe1' | 'poe2'
 type BuyoutType = 'iob' | 'inperson' | 'both'
-type Rarity = 'normal' | 'magic' | 'rare' | 'unique'
+type Rarity = 'normal' | 'magic' | 'rare' | 'unique' | 'currency' | 'gem' | 'divination'
 
 interface League { id: string; text: string }
 
@@ -196,6 +196,64 @@ async function runSearch() {
   }
 }
 
+// ── Pseudo-stats ─────────────────────────────────────────────────────────────
+interface PseudoContributor { pattern: string; weight: number }
+interface PseudoDef { id: string; label: string; contributors: PseudoContributor[] }
+
+const PSEUDO_DEFS: PseudoDef[] = [
+  { id: 'pseudo.pseudo_total_life',
+    label: 'Total Life',
+    contributors: [
+      { pattern: '+# to maximum life', weight: 1 },
+    ] },
+  { id: 'pseudo.pseudo_total_mana',
+    label: 'Total Mana',
+    contributors: [
+      { pattern: '+# to maximum mana', weight: 1 },
+    ] },
+  { id: 'pseudo.pseudo_total_energy_shield',
+    label: 'Total Energy Shield',
+    contributors: [
+      { pattern: '+# to maximum energy shield', weight: 1 },
+    ] },
+  { id: 'pseudo.pseudo_total_elemental_resistance',
+    label: 'Total Elemental Res',
+    contributors: [
+      { pattern: '+#% to fire resistance',           weight: 1 },
+      { pattern: '+#% to cold resistance',           weight: 1 },
+      { pattern: '+#% to lightning resistance',      weight: 1 },
+      { pattern: '+#% to all elemental resistances', weight: 3 },
+      { pattern: '+#% to all resistances',           weight: 3 },
+      { pattern: '+#% to fire and cold resistances', weight: 2 },
+      { pattern: '+#% to fire and lightning resistances', weight: 2 },
+      { pattern: '+#% to cold and lightning resistances', weight: 2 },
+    ] },
+]
+
+function computePseudoStats(
+  mods: ItemData['mods'],
+  filtersOn: boolean
+): Affix[] {
+  return PSEUDO_DEFS.flatMap(def => {
+    const value = def.contributors.reduce((sum, c) => {
+      return sum + mods
+        .filter(m => m.text.toLowerCase() === c.pattern)
+        .reduce((s, m) => s + m.value * c.weight, 0)
+    }, 0)
+    if (value === 0) return []
+    return [{
+      id: def.id,
+      text: def.label,
+      value,
+      min: Math.max(1, Math.floor(value * 0.8)),
+      max: null,
+      enabled: filtersOn,
+      stat_id: def.id,
+      mod_group: 'pseudo',
+    } as Affix]
+  })
+}
+
 const item = ref({
   name: '—',
   rarity: 'normal' as Rarity,
@@ -218,7 +276,10 @@ const rarityClass = computed(() => `rarity-${item.value.rarity}`)
 
 const corruptedAffixes = computed(() => item.value.affixes.filter(a => a.mod_group === 'corrupted'))
 const implicitAffixes  = computed(() => item.value.affixes.filter(a => a.mod_group === 'implicit' || a.mod_group === 'enchant'))
-const explicitAffixes  = computed(() => item.value.affixes.filter(a => a.mod_group !== 'corrupted' && a.mod_group !== 'implicit' && a.mod_group !== 'enchant'))
+const pseudoAffixes    = computed(() => item.value.affixes.filter(a => a.mod_group === 'pseudo'))
+const explicitAffixes  = computed(() => item.value.affixes.filter(
+  a => a.mod_group !== 'corrupted' && a.mod_group !== 'implicit' && a.mod_group !== 'enchant' && a.mod_group !== 'pseudo'
+))
 
 const medianPrice = computed(() => {
   if (!results.value.length) return null
@@ -299,9 +360,16 @@ onMounted(async () => {
     searching.value = false
     const newMode = payload.game_mode as GameMode
     if (newMode !== gameMode.value) setGameMode(newMode)
+
+    const rarity = payload.rarity as Rarity
+    // For unique/currency/gem: auto-search with filters off so the initial search
+    // uses just name or type. User can enable individual filters and re-search.
+    const autoSearch = rarity === 'unique' || rarity === 'currency' || rarity === 'gem'
+    const filtersOn  = !autoSearch
+
     item.value = {
       name: payload.name,
-      rarity: payload.rarity as Rarity,
+      rarity,
       baseType: payload.base_type,
       itemLevel: payload.item_level,
       itemClass: payload.item_class,
@@ -309,28 +377,31 @@ onMounted(async () => {
       corrupted: payload.corrupted,
       corruptedFilter: payload.corrupted,
       baseStats: payload.base_stats.map(s => ({
-        id: s.id,
-        label: s.label,
-        value: s.value,
-        min: Math.floor(s.value * 0.8),
+        id: s.id, label: s.label, value: s.value,
+        // gem_level: use exact value as min (not 80%) and always enabled
+        min: s.id === 'gem_level' ? s.value : Math.floor(s.value * 0.8),
         max: null,
-        enabled: true,
+        enabled: filtersOn || s.id === 'gem_level',
       })),
-      typeEnabled: false,
+      typeEnabled: rarity === 'currency' || rarity === 'gem',
       ilvlEnabled: false,
       ilvlMin: payload.item_level,
-      affixes: payload.mods.map((mod, i) => ({
-        id: String(i),
-        text: mod.text,
-        value: mod.value,
-        min: mod.value >= 5 ? Math.floor(mod.value * 0.8) : null,
-        max: null,
-        enabled: true,
-        stat_id: mod.stat_id ?? null,
-        mod_group: mod.mod_group,
-      })),
+      affixes: [
+        ...computePseudoStats(payload.mods, filtersOn),
+        ...payload.mods.map((mod, i) => ({
+          id: String(i),
+          text: mod.text, value: mod.value,
+          min: mod.value >= 5 ? Math.floor(mod.value * 0.8) : null,
+          max: null,
+          enabled: filtersOn,
+          stat_id: mod.stat_id ?? null,
+          mod_group: mod.mod_group,
+        })),
+      ],
     }
     results.value = []
+
+    if (autoSearch) nextTick(() => runSearch())
   }))
 })
 
@@ -439,7 +510,7 @@ async function openTradeSite() {
             <span :class="['item-base', { 'filter-active': item.typeEnabled }]">{{ item.baseType }}</span>
           </label>
           <div class="item-meta">
-            <label class="item-filter-row" @click.stop="item.ilvlEnabled = !item.ilvlEnabled; handleInteract()">
+            <label v-if="item.rarity !== 'gem'" class="item-filter-row" @click.stop="item.ilvlEnabled = !item.ilvlEnabled; handleInteract()">
               <input class="item-filter-cb" type="checkbox" v-model="item.ilvlEnabled" @click.stop />
               <span :class="{ 'filter-active': item.ilvlEnabled }">Item Level {{ item.itemLevel }}</span>
             </label>
@@ -516,10 +587,40 @@ async function openTradeSite() {
       </div>
     </template>
 
-    <div class="sep" />
+    <div v-if="item.affixes.length" class="sep" />
 
     <!-- ── Affixes ─────────────────────────────────────── -->
-    <div class="section">
+    <div v-if="item.affixes.length" class="section">
+
+      <!-- Pseudo stats sub-group -->
+      <template v-if="pseudoAffixes.length">
+        <div class="section-title">PSEUDO STATS</div>
+        <div class="affix-list" :class="{ 'affix-loading': searching }">
+          <label
+            v-for="affix in pseudoAffixes"
+            v-show="!searching"
+            :key="affix.id"
+            class="affix-row"
+            @click="handleInteract"
+          >
+            <input class="affix-checkbox" type="checkbox" v-model="affix.enabled" />
+            <span :class="['affix-text', 'pseudo-stat-text', { dimmed: !affix.enabled }]">
+              {{ affix.text }}
+            </span>
+            <span class="pseudo-stat-value">{{ affix.value }}</span>
+            <div class="affix-range">
+              <input class="range-input" type="number" placeholder="min"
+                v-model.number="affix.min" :disabled="!affix.enabled"
+                @focus="onRangeInputFocus" @blur="onRangeInputBlur" @click.stop />
+              <input class="range-input" type="number" placeholder="max"
+                v-model.number="affix.max" :disabled="!affix.enabled"
+                @focus="onRangeInputFocus" @blur="onRangeInputBlur" @click.stop />
+            </div>
+          </label>
+        </div>
+        <div v-if="corruptedAffixes.length || implicitAffixes.length || explicitAffixes.length" class="subsep" />
+      </template>
+
       <!-- Corruption implicits sub-group -->
       <template v-if="corruptedAffixes.length">
         <div class="section-title">CORRUPTION IMPLICITS</div>
@@ -827,10 +928,13 @@ async function openTradeSite() {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.rarity-rare   { color: var(--rare); text-shadow: 0 0 12px rgba(255,215,0,0.3); }
-.rarity-magic  { color: var(--magic); }
-.rarity-unique { color: var(--unique); }
-.rarity-normal { color: var(--normal); }
+.rarity-rare      { color: var(--rare); text-shadow: 0 0 12px rgba(255,215,0,0.3); }
+.rarity-magic     { color: var(--magic); }
+.rarity-unique    { color: var(--unique); }
+.rarity-normal    { color: var(--normal); }
+.rarity-currency  { color: #c8a96e; }
+.rarity-gem       { color: #1ba29b; }
+.rarity-divination{ color: #9c6eca; }
 
 .item-filter-row {
   display: inline-flex;
@@ -868,7 +972,7 @@ async function openTradeSite() {
 .influence { color: var(--currency); }
 .corrupted-tag { color: #b74545; }
 .corrupted-tag.filter-active { color: #ff6b6b !important; }
-.subsep { height: 1px; background: var(--border); margin: 4px 0 6px; opacity: 0.4; }
+.subsep { height: 1px; background: var(--border); margin: 3px 0 4px; opacity: 0.4; }
 
 .item-info-right {
   flex-shrink: 0;
@@ -921,7 +1025,7 @@ async function openTradeSite() {
 
 /* ── Section ─────────────────────────────────────────── */
 .section {
-  padding: 8px 14px;
+  padding: 6px 12px;
   flex-shrink: 0;
 }
 .section-title {
@@ -929,23 +1033,23 @@ async function openTradeSite() {
   font-weight: 700;
   letter-spacing: 0.1em;
   color: var(--text-label);
-  margin-bottom: 6px;
+  margin-bottom: 4px;
 }
 
 /* ── Affixes ─────────────────────────────────────────── */
 .affix-list {
   display: flex;
   flex-direction: column;
-  gap: 3px;
-  max-height: 220px;
+  gap: 1px;
+  max-height: 260px;
   overflow-y: auto;
   overflow-x: hidden;
 }
 .affix-row {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 4px 6px;
+  gap: 6px;
+  padding: 2px 4px;
   border-radius: 3px;
   cursor: pointer;
   transition: background 0.1s;
@@ -1019,7 +1123,7 @@ async function openTradeSite() {
 .actions {
   display: flex;
   gap: 8px;
-  padding: 8px 14px;
+  padding: 6px 12px;
   flex-shrink: 0;
 }
 .action-btn {
@@ -1122,5 +1226,22 @@ async function openTradeSite() {
 .affix-loading {
   min-height: 32px;
   opacity: 0.3;
+}
+
+/* ── Pseudo stats ────────────────────────────────────── */
+.pseudo-stat-text {
+  color: #7eaec8 !important;
+}
+.pseudo-stat-text.dimmed {
+  color: var(--text-muted) !important;
+}
+.pseudo-stat-value {
+  font-size: 11px;
+  color: #7eaec8;
+  font-weight: 600;
+  flex-shrink: 0;
+  min-width: 28px;
+  text-align: right;
+  opacity: 0.8;
 }
 </style>

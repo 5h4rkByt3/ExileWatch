@@ -29,6 +29,7 @@ struct ParsedMod {
 struct StatEntry {
     id: String,
     text: String,
+    group: String,
 }
 
 struct StatCache(Mutex<std::collections::HashMap<String, Vec<StatEntry>>>);
@@ -350,14 +351,39 @@ fn strip_roll_ranges(s: &str) -> String {
 }
 
 fn find_stat<'a>(needle: &str, entries: &'a [StatEntry]) -> Option<&'a StatEntry> {
+    find_stat_prefer_group(needle, entries, "")
+}
+
+fn find_stat_prefer_group<'a>(needle: &str, entries: &'a [StatEntry], preferred_group: &str) -> Option<&'a StatEntry> {
+    if !preferred_group.is_empty() {
+        let hit = entries.iter().find(|e| e.group == preferred_group && e.text.trim().to_lowercase() == needle);
+        if hit.is_some() { return hit; }
+    }
     entries.iter().find(|e| e.text.trim().to_lowercase() == needle)
 }
 
-fn match_stat_id(mod_text: &str, entries: &[StatEntry]) -> Option<String> {
-    let needle = mod_text.trim().to_lowercase();
+fn preferred_stat_group(item_class: &str) -> &'static str {
+    let lc = item_class.to_lowercase();
+    if lc.contains("sword") || lc.contains("axe") || lc.contains("mace") ||
+       lc.contains("bow")   || lc.contains("spear") || lc.contains("wand") ||
+       lc.contains("staff") || lc.contains("crossbow") || lc.contains("dagger") ||
+       lc.contains("sceptre") || lc.contains("claw") || lc.contains("flail") ||
+       lc.contains("quarterstaff") {
+        "Weapon"
+    } else if lc.contains("body armour") || lc.contains("helmets") || lc.contains("gloves") ||
+              lc.contains("boots") || lc.contains("shields") {
+        "Armour"
+    } else {
+        ""
+    }
+}
 
-    // 1. Exact match
-    if let Some(e) = find_stat(&needle, entries) { return Some(e.id.clone()); }
+fn match_stat_id(mod_text: &str, entries: &[StatEntry], item_class: &str) -> Option<String> {
+    let needle = mod_text.trim().to_lowercase();
+    let group  = preferred_stat_group(item_class);
+
+    // 1. Exact match — prefer the item's equipment group (e.g. "Weapon" for local mods)
+    if let Some(e) = find_stat_prefer_group(&needle, entries, group) { return Some(e.id.clone()); }
 
     // 2. PoE2: "+# to X"  →  "+# total X"  (life, mana, energy shield…)
     if let Some(rest) = needle.strip_prefix("+# to ") {
@@ -393,7 +419,9 @@ async fn load_stats(game_mode: &str, cookie_name: &str, cookie_value: &str) -> R
     };
 
     #[derive(serde::Deserialize)]
-    struct Group { entries: Vec<StatEntry> }
+    struct ApiEntry { id: String, text: String }
+    #[derive(serde::Deserialize)]
+    struct Group { label: String, entries: Vec<ApiEntry> }
     #[derive(serde::Deserialize)]
     struct Resp { result: Vec<Group> }
 
@@ -414,7 +442,12 @@ async fn load_stats(game_mode: &str, cookie_name: &str, cookie_value: &str) -> R
         .json::<Resp>()
         .await
         .map_err(|e| format!("parse: {e}"))
-        .map(|r| r.result.into_iter().flat_map(|g| g.entries).collect())
+        .map(|r| r.result.into_iter().flat_map(|g| {
+            let label = g.label;
+            g.entries.into_iter().map(move |e| StatEntry {
+                id: e.id, text: e.text, group: label.clone(),
+            })
+        }).collect())
 }
 
 fn is_adds_range_mod(line: &str) -> bool {
@@ -560,8 +593,19 @@ const SKIP_TAGS: &[&str] = &[
     "Corrupted", "Mirrored", "Unidentified",
 ];
 
+fn is_poe_item(text: &str) -> bool {
+    if !text.contains("Rarity:") { return false; }
+    // Equipment always has an item level
+    if text.contains("Item Level:") { return true; }
+    // Currency, gems, divination cards etc. don't have item level
+    text.contains("Rarity: Currency")
+        || text.contains("Rarity: Gem")
+        || text.contains("Rarity: Divination Card")
+        || text.contains("Item Class: Divination Cards")
+}
+
 fn parse_poe_item(text: &str) -> Option<ParsedItem> {
-    if !text.contains("Rarity:") || !text.contains("Item Level:") {
+    if !is_poe_item(text) {
         return None;
     }
 
@@ -576,10 +620,13 @@ fn parse_poe_item(text: &str) -> Option<ParsedItem> {
         .map(str::trim)?;
 
     let rarity_key = match rarity {
-        "Normal" => "normal",
-        "Magic"  => "magic",
-        "Rare"   => "rare",
-        "Unique" => "unique",
+        "Normal"           => "normal",
+        "Magic"            => "magic",
+        "Rare"             => "rare",
+        "Unique"           => "unique",
+        "Currency"         => "currency",
+        "Gem"              => "gem",
+        "Divination Card"  => "divination",
         _ => return None,
     };
 
@@ -600,9 +647,12 @@ fn parse_poe_item(text: &str) -> Option<ParsedItem> {
         _ => return None,
     };
 
-    // Item level
+    // Item level — gems use "Gem Level:" instead of "Item Level:"
     let item_level: u32 = text.lines()
-        .find_map(|l| l.strip_prefix("Item Level: "))
+        .find_map(|l| {
+            let l = l.trim();
+            l.strip_prefix("Item Level: ").or_else(|| l.strip_prefix("Gem Level: "))
+        })
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(0);
 
@@ -620,12 +670,30 @@ fn parse_poe_item(text: &str) -> Option<ParsedItem> {
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
 
-    // Sections after "Item Level:" section contain mods
-    let il_idx = sections.iter().position(|s| s.contains("Item Level: "))?;
+    let corrupted = text.lines().any(|l| l.trim() == "Corrupted");
+
+    // Currency, gems, divination cards etc. — no item level section, no mods, no base stats.
+    // Return early with just the identity fields; the frontend handles display/search.
+    let il_idx = sections.iter().position(|s| s.contains("Item Level: "));
+    if il_idx.is_none() || matches!(rarity_key, "currency" | "gem" | "divination") {
+        // Gems expose their level as a searchable base stat so the trade query can
+        // include misc_filters.gem_level.
+        let base_stats = if rarity_key == "gem" && item_level > 0 {
+            vec![BaseStat { id: "gem_level".into(), label: "Gem Level".into(), value: item_level as f64 }]
+        } else {
+            vec![]
+        };
+        return Some(ParsedItem {
+            name, base_type, item_class,
+            rarity: rarity_key.to_string(),
+            item_level, influence: String::new(),
+            game_mode: detect_poe_game().to_string(),
+            base_stats, corrupted, mods: vec![],
+        });
+    }
+    let il_idx = il_idx.unwrap();
 
     let base_stats = parse_base_stats(&sections, il_idx);
-
-    let corrupted = text.lines().any(|l| l.trim() == "Corrupted");
 
     let mut mods = Vec::new();
     for section in &sections[il_idx + 1..] {
@@ -907,7 +975,7 @@ async fn on_alt_d(handle: &tauri::AppHandle) {
             eprintln!("[EW {}] poll #{:02}: {}ms  {} bytes  {}", ts(), attempt, elapsed, content.len(), tag);
 
             if !content.is_empty() && content != baseline {
-                if content.contains("Rarity:") && content.contains("Item Level:") {
+                if is_poe_item(&content) {
                     eprintln!("[EW {}] PoE item detected at attempt {}", ts(), attempt);
                     return content;
                 }
@@ -921,10 +989,7 @@ async fn on_alt_d(handle: &tauri::AppHandle) {
         }
         // Same-item case: only fall back to original snapshot if it was a PoE item
         // AND we never saw non-item content (which would mean cursor wasn't on an item).
-        if !saw_non_item
-            && original_snapshot.contains("Rarity:")
-            && original_snapshot.contains("Item Level:")
-        {
+        if !saw_non_item && is_poe_item(&original_snapshot) {
             eprintln!("[EW {}] unchanged — same-item fallback ({} bytes)", ts(), original_snapshot.len());
             original_snapshot
         } else {
@@ -968,11 +1033,11 @@ async fn on_alt_d(handle: &tauri::AppHandle) {
     };
 
     let item = if let Some(ref entries) = stat_entries {
-        let matched: usize = item.mods.iter().filter(|m| match_stat_id(&m.text, entries).is_some()).count();
+        let matched: usize = item.mods.iter().filter(|m| match_stat_id(&m.text, entries, &item.item_class).is_some()).count();
         eprintln!("[EW {}] stat match: {}/{} mods resolved", ts(), matched, item.mods.len());
         ParsedItem {
             mods: item.mods.into_iter().map(|m| {
-                let sid = match_stat_id(&m.text, entries);
+                let sid = match_stat_id(&m.text, entries, &item.item_class);
                 ParsedMod { stat_id: sid, ..m }
             }).collect(),
             ..item
@@ -1204,11 +1269,16 @@ async fn trade_search(
     let mut weapon_block = serde_json::Map::new();
     let mut armour_block = serde_json::Map::new();
     let mut ilvl_min: Option<f64> = None;
+    let mut gem_level_min: Option<f64> = None;
 
     for f in &base_filters {
         let id = f.stat_id.as_str();
         if id == "ilvl" {
             ilvl_min = f.min;
+            continue;
+        }
+        if id == "gem_level" {
+            gem_level_min = f.min;
             continue;
         }
         let mut val = serde_json::Map::new();
@@ -1246,6 +1316,9 @@ async fn trade_search(
         let mut misc = serde_json::Map::new();
         if let Some(min) = ilvl_min {
             misc.insert("ilvl".into(), serde_json::json!({ "min": min }));
+        }
+        if let Some(min) = gem_level_min {
+            misc.insert("gem_level".into(), serde_json::json!({ "min": min }));
         }
         if let Some(corr) = corrupted {
             misc.insert("corrupted".into(), serde_json::json!({
