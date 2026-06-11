@@ -181,6 +181,8 @@ async function runSearch() {
       league: selectedLeague.value,
       gameMode: gameMode.value,
       currency: selectedCurrency.value,
+      buyoutType: buyoutType.value,
+      itemClass: item.value.itemClass,
       itemName: itemNameArg,
       itemType: item.value.typeEnabled ? item.value.baseType : '',
       corrupted: corruptedArg,
@@ -378,10 +380,9 @@ onMounted(async () => {
       corruptedFilter: payload.corrupted,
       baseStats: payload.base_stats.map(s => ({
         id: s.id, label: s.label, value: s.value,
-        // gem_level: use exact value as min (not 80%) and always enabled
-        min: s.id === 'gem_level' ? s.value : Math.floor(s.value * 0.8),
+        min: (s.id === 'gem_level' || s.id === 'sockets') ? s.value : Math.floor(s.value * 0.8),
         max: null,
-        enabled: filtersOn || s.id === 'gem_level',
+        enabled: filtersOn || s.id === 'gem_level' || s.id === 'sockets',
       })),
       typeEnabled: rarity === 'currency' || rarity === 'gem',
       ilvlEnabled: false,

@@ -363,52 +363,75 @@ fn find_stat_prefer_group<'a>(needle: &str, entries: &'a [StatEntry], preferred_
 }
 
 fn preferred_stat_group(item_class: &str) -> &'static str {
-    let lc = item_class.to_lowercase();
-    if lc.contains("sword") || lc.contains("axe") || lc.contains("mace") ||
-       lc.contains("bow")   || lc.contains("spear") || lc.contains("wand") ||
-       lc.contains("staff") || lc.contains("crossbow") || lc.contains("dagger") ||
-       lc.contains("sceptre") || lc.contains("claw") || lc.contains("flail") ||
-       lc.contains("quarterstaff") {
-        "Weapon"
-    } else if lc.contains("body armour") || lc.contains("helmets") || lc.contains("gloves") ||
-              lc.contains("boots") || lc.contains("shields") {
-        "Armour"
-    } else {
-        ""
+    match item_class_to_category(item_class) {
+        Some(cat) if cat.starts_with("weapon.") => "Weapon",
+        Some(cat) if cat.starts_with("armour.")  => "Armour",
+        _ => "",
     }
 }
 
+// Weapon-local and armour-local stat ID overrides sourced from Exile Exchange 2.
+// The GGG stats API puts both the global and local variants in the same "Explicit"
+// group with identical text, so group-preference alone can't distinguish them.
+// Format: (required_preferred_group, global_id, local_id)
+const LOCAL_STAT_OVERRIDES: &[(&str, &str, &str)] = &[
+    ("Weapon", "explicit.stat_681332047",  "explicit.stat_210067635"),  // #% increased Attack Speed
+    ("Weapon", "explicit.stat_803737631",  "explicit.stat_691932474"),  // # to Accuracy Rating
+    ("Weapon", "explicit.stat_3146310524", "explicit.stat_2933846633"), // Dazes on Hit
+    ("Armour", "explicit.stat_2866361420", "explicit.stat_1062208444"), // #% increased Armour
+    ("Armour", "explicit.stat_2106365538", "explicit.stat_124859000"),  // #% increased Evasion Rating
+    ("Armour", "explicit.stat_4147897060", "explicit.stat_2481353198"), // #% increased Block chance
+    ("Armour", "explicit.stat_53045048",   "explicit.stat_2144192055"), // # to Evasion Rating
+];
+
+fn apply_local_override(id: String, group: &str) -> String {
+    if group.is_empty() { return id; }
+    for &(req, global, local) in LOCAL_STAT_OVERRIDES {
+        if req == group && id == global {
+            return local.to_string();
+        }
+    }
+    id
+}
+
 fn match_stat_id(mod_text: &str, entries: &[StatEntry], item_class: &str) -> Option<String> {
-    let needle = mod_text.trim().to_lowercase();
+    // Strip PoE2 roll-range annotations: "+#(#-#)%" → "+#%"
+    let raw    = mod_text.trim().to_lowercase();
+    let needle = raw.replace("(#-#)", "");
+    let needle = needle.trim();
     let group  = preferred_stat_group(item_class);
 
-    // 1. Exact match — prefer the item's equipment group (e.g. "Weapon" for local mods)
-    if let Some(e) = find_stat_prefer_group(&needle, entries, group) { return Some(e.id.clone()); }
+    let found = (|| {
+        // 1. Exact match (group-preference kept for future API changes)
+        if let Some(e) = find_stat_prefer_group(needle, entries, group) { return Some(e.id.clone()); }
 
-    // 2. PoE2: "+# to X"  →  "+# total X"  (life, mana, energy shield…)
-    if let Some(rest) = needle.strip_prefix("+# to ") {
-        let candidate = format!("+# total {rest}");
-        if let Some(e) = find_stat(&candidate, entries) { return Some(e.id.clone()); }
-    }
+        // 2. PoE2: "+# to X"  →  "+# total X"  (life, mana, energy shield…)
+        if let Some(rest) = needle.strip_prefix("+# to ") {
+            let c = format!("+# total {rest}");
+            if let Some(e) = find_stat(&c, entries) { return Some(e.id.clone()); }
+        }
 
-    // 3. PoE2: "+#% to X"  →  "+#% total to X"  (resistances)
-    if let Some(rest) = needle.strip_prefix("+#% to ") {
-        let candidate = format!("+#% total to {rest}");
-        if let Some(e) = find_stat(&candidate, entries) { return Some(e.id.clone()); }
-    }
+        // 3. PoE2: "+#% to X"  →  "+#% total to X"  (resistances)
+        if let Some(rest) = needle.strip_prefix("+#% to ") {
+            let c = format!("+#% total to {rest}");
+            if let Some(e) = find_stat(&c, entries) { return Some(e.id.clone()); }
+        }
 
-    // 4. PoE2: "#% to X"  →  "#% total to X"
-    if let Some(rest) = needle.strip_prefix("#% to ") {
-        let candidate = format!("#% total to {rest}");
-        if let Some(e) = find_stat(&candidate, entries) { return Some(e.id.clone()); }
-    }
+        // 4. PoE2: "#% to X"  →  "#% total to X"
+        if let Some(rest) = needle.strip_prefix("#% to ") {
+            let c = format!("#% total to {rest}");
+            if let Some(e) = find_stat(&c, entries) { return Some(e.id.clone()); }
+        }
 
-    // 5. GGG omits leading '+' on some stats (e.g. "+# to Spirit" → "# to Spirit")
-    if let Some(rest) = needle.strip_prefix('+') {
-        if let Some(e) = find_stat(rest, entries) { return Some(e.id.clone()); }
-    }
+        // 5. GGG omits leading '+' on some stats (e.g. "+# to Spirit" → "# to Spirit")
+        if let Some(rest) = needle.strip_prefix('+') {
+            if let Some(e) = find_stat(rest, entries) { return Some(e.id.clone()); }
+        }
 
-    None
+        None
+    })();
+
+    found.map(|id| apply_local_override(id, group))
 }
 
 async fn load_stats(game_mode: &str, cookie_name: &str, cookie_value: &str) -> Result<Vec<StatEntry>, String> {
@@ -500,10 +523,14 @@ fn parse_base_stats(sections: &[&str], il_idx: usize) -> Vec<BaseStat> {
     let mut ward: Option<f64> = None;
     let mut block: Option<f64> = None;
 
+    let mut sockets: Option<u32> = None;
     for section in sections.iter().take(il_idx).skip(1) {
         for raw_line in section.trim().lines() {
             let line = strip_qualifier(raw_line.trim()).trim();
-            if line.starts_with("Quality:") || line.starts_with("Requires:") || line.starts_with("Sockets:") {
+            if line.starts_with("Quality:") || line.starts_with("Requires:") { continue; }
+            if let Some(v) = line.strip_prefix("Sockets: ") {
+                sockets = v.trim().parse::<u32>().ok()
+                    .or_else(|| Some(v.split_whitespace().count() as u32));
                 continue;
             }
             if let Some(v) = line.strip_prefix("Physical Damage: ") {
@@ -549,6 +576,7 @@ fn parse_base_stats(sections: &[&str], il_idx: usize) -> Vec<BaseStat> {
     if let Some(v) = es    { stats.push(BaseStat { id: "es".into(),    label: "Energy Shield".into(),  value: v }); }
     if let Some(v) = ward  { stats.push(BaseStat { id: "ward".into(),  label: "Ward".into(),           value: v }); }
     if let Some(v) = block { stats.push(BaseStat { id: "block".into(), label: "Block %".into(),        value: v }); }
+    if let Some(v) = sockets { stats.push(BaseStat { id: "sockets".into(), label: "Sockets".into(), value: v as f64 }); }
 
     stats
 }
@@ -711,13 +739,30 @@ fn parse_poe_item(text: &str) -> Option<ParsedItem> {
             if line.is_empty() { continue; }
             if line.starts_with('(') && line.ends_with(')') { continue; }
             if line.starts_with('{') {
+                let ll = line.to_lowercase();
                 current_group = if line.contains("Corruption Enhancement") { "corrupted" }
                     else if line.contains("Implicit")    { "implicit" }
                     else if line.contains("Enchantment") { "enchant"  }
-                    else                                  { "explicit" };
+                    else if ll.contains("rune") || ll.contains("socket")
+                        || ll.contains("idol") || ll.contains("soul core")
+                        || ll.contains("augment") { "socketed" }
+                    else                          { "explicit" };
                 continue;
             }
             if SKIP_TAGS.iter().any(|&t| line == t) { continue; }
+            if current_group == "socketed" {
+                eprintln!("[EW {}] skip socketed mod (header): {:?}", ts(), line);
+                continue;
+            }
+            {
+                let ll = line.to_lowercase();
+                if ll.ends_with("(rune)") || ll.ends_with("(soul core)")
+                    || ll.ends_with("(idol)") || ll.ends_with("(augment)")
+                    || ll.ends_with("(ancient augment)") {
+                    eprintln!("[EW {}] skip socketed mod (suffix): {:?}", ts(), line);
+                    continue;
+                }
+            }
             if let Some(mut m) = parse_mod_line(line) {
                 m.mod_group = current_group.to_string();
                 mods.push(m);
@@ -1033,15 +1078,16 @@ async fn on_alt_d(handle: &tauri::AppHandle) {
     };
 
     let item = if let Some(ref entries) = stat_entries {
-        let matched: usize = item.mods.iter().filter(|m| match_stat_id(&m.text, entries, &item.item_class).is_some()).count();
-        eprintln!("[EW {}] stat match: {}/{} mods resolved", ts(), matched, item.mods.len());
-        ParsedItem {
-            mods: item.mods.into_iter().map(|m| {
-                let sid = match_stat_id(&m.text, entries, &item.item_class);
-                ParsedMod { stat_id: sid, ..m }
-            }).collect(),
-            ..item
-        }
+        let mods: Vec<ParsedMod> = item.mods.into_iter().map(|m| {
+            let sid = match_stat_id(&m.text, entries, &item.item_class);
+            if sid.is_none() {
+                eprintln!("[EW {}] unresolved mod: {:?}", ts(), m.text);
+            }
+            ParsedMod { stat_id: sid, ..m }
+        }).collect();
+        let matched = mods.iter().filter(|m| m.stat_id.is_some()).count();
+        eprintln!("[EW {}] stat match: {}/{} mods resolved  class={:?}", ts(), matched, mods.len(), item.item_class);
+        ParsedItem { mods, ..item }
 
     } else {
         item
@@ -1076,7 +1122,7 @@ fn find_profile_in(ff_dir: &std::path::Path) -> Option<std::path::PathBuf> {
         if rel { ff_dir.join(path) } else { std::path::PathBuf::from(path) }
     };
 
-    let mut commit = |path: &str, rel: bool, def: bool, fb: &mut Option<std::path::PathBuf>| -> Option<std::path::PathBuf> {
+    let commit = |path: &str, rel: bool, def: bool, fb: &mut Option<std::path::PathBuf>| -> Option<std::path::PathBuf> {
         if path.is_empty() { return None; }
         let full = resolve(path, rel);
         if !full.join("cookies.sqlite").exists() { return None; }
@@ -1222,9 +1268,11 @@ async fn trade_search(
     league: String,
     game_mode: String,
     currency: String,
-    item_name: String,       // non-empty only for unique items
-    item_type: String,       // non-empty when user enables base-type filter
-    corrupted: Option<bool>, // Some(true/false) to filter, None for any
+    buyout_type: String,      // "iob" | "inperson" | "both"
+    item_class: String,       // always sent as type_filters category
+    item_name: String,        // non-empty only for unique items
+    item_type: String,        // non-empty when user enables base-type filter
+    corrupted: Option<bool>,  // Some(true/false) to filter, None for any
     filters: Vec<StatFilter>,
     base_filters: Vec<StatFilter>, // stat_id is "dps"/"ar"/"ilvl" etc.
     session: tauri::State<'_, PoeSession>,
@@ -1270,6 +1318,7 @@ async fn trade_search(
     let mut armour_block = serde_json::Map::new();
     let mut ilvl_min: Option<f64> = None;
     let mut gem_level_min: Option<f64> = None;
+    let mut sockets_min: Option<f64> = None;
 
     for f in &base_filters {
         let id = f.stat_id.as_str();
@@ -1279,6 +1328,10 @@ async fn trade_search(
         }
         if id == "gem_level" {
             gem_level_min = f.min;
+            continue;
+        }
+        if id == "sockets" {
+            sockets_min = f.min;
             continue;
         }
         let mut val = serde_json::Map::new();
@@ -1292,11 +1345,24 @@ async fn trade_search(
         }
     }
 
+    let mut trade_inner = serde_json::json!({ "price": { "option": currency } });
+    // "In Person" = stash-tab trade, seller must be online to whisper.
+    // "IOB" = Ange's store purchase, no online requirement — no account filter needed.
+    // "Both" = show all listings.
+    if buyout_type == "inperson" {
+        trade_inner["account"] = serde_json::json!({ "option": "online" });
+    }
     let mut query_filters = serde_json::json!({
-        "trade_filters": {
-            "filters": { "price": { "option": currency } }
-        }
+        "trade_filters": { "filters": trade_inner }
     });
+
+    // Always restrict to the item's equipment category so results don't bleed
+    // across item types (e.g. a spear search returning armour pieces).
+    if let Some(cat) = item_class_to_category(&item_class) {
+        query_filters["type_filters"] = serde_json::json!({
+            "filters": { "category": { "option": cat } }
+        });
+    }
     if game_mode == "poe2" {
         // PoE2 API unifies weapon + defence stats under a single "equipment_filters" group
         let mut equip_block = weapon_block.clone();
@@ -1319,6 +1385,9 @@ async fn trade_search(
         }
         if let Some(min) = gem_level_min {
             misc.insert("gem_level".into(), serde_json::json!({ "min": min }));
+        }
+        if let Some(min) = sockets_min {
+            misc.insert("sockets".into(), serde_json::json!({ "min": min }));
         }
         if let Some(corr) = corrupted {
             misc.insert("corrupted".into(), serde_json::json!({
