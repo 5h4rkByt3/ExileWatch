@@ -22,6 +22,7 @@ struct ParsedMod {
     text: String,
     value: f64,
     stat_id: Option<String>,
+    mod_group: String, // "explicit" | "implicit" | "corrupted" | "enchant"
 }
 
 #[derive(serde::Deserialize, Clone)]
@@ -33,6 +34,13 @@ struct StatEntry {
 struct StatCache(Mutex<std::collections::HashMap<String, Vec<StatEntry>>>);
 
 #[derive(serde::Serialize, Clone)]
+struct BaseStat {
+    id: String,
+    label: String,
+    value: f64,
+}
+
+#[derive(serde::Serialize, Clone)]
 struct ParsedItem {
     name: String,
     base_type: String,
@@ -40,15 +48,46 @@ struct ParsedItem {
     item_level: u32,
     influence: String,
     game_mode: String,
+    item_class: String,
+    base_stats: Vec<BaseStat>,
+    corrupted: bool,
     mods: Vec<ParsedMod>,
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────────
 
-#[tauri::command]
+#[cfg_attr(not(target_os = "linux"), tauri::command)]
+#[cfg_attr(target_os = "linux", tauri::command)]
 fn hide_overlay(app: tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
-        let _ = w.hide();
+        let _ = w.clone().run_on_main_thread(move || {
+            #[cfg(target_os = "linux")]
+            {
+                use gtk_layer_shell::{KeyboardMode, LayerShell};
+                if let Ok(gtk_win) = w.gtk_window() {
+                    // Set None while still mapped so KWin returns focus to PoE2
+                    // BEFORE the surface is unmapped. Setting it after hide is a no-op.
+                    gtk_win.set_keyboard_mode(KeyboardMode::None);
+                }
+            }
+            let _ = w.hide();
+        });
+    }
+}
+
+#[tauri::command]
+fn set_overlay_keyboard(app: tauri::AppHandle, enabled: bool) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.clone().run_on_main_thread(move || {
+            #[cfg(target_os = "linux")]
+            {
+                use gtk_layer_shell::{KeyboardMode, LayerShell};
+                if let Ok(gtk_win) = w.gtk_window() {
+                    let mode = if enabled { KeyboardMode::OnDemand } else { KeyboardMode::None };
+                    gtk_win.set_keyboard_mode(mode);
+                }
+            }
+        });
     }
 }
 
@@ -405,7 +444,110 @@ fn parse_mod_line(line: &str) -> Option<ParsedMod> {
     } else {
         nums[0].abs()
     };
-    Some(ParsedMod { text: numbers_to_hash(line), value, stat_id: None })
+    Some(ParsedMod { text: numbers_to_hash(line), value, stat_id: None, mod_group: String::new() })
+}
+
+fn parse_damage_range(s: &str) -> Option<(f64, f64)> {
+    let (a, b) = s.trim().split_once('-')?;
+    let a = a.trim().parse::<f64>().ok()?;
+    let b = b.trim().parse::<f64>().ok()?;
+    Some((a, b))
+}
+
+fn round1(v: f64) -> f64 { (v * 10.0).round() / 10.0 }
+
+fn parse_base_stats(sections: &[&str], il_idx: usize) -> Vec<BaseStat> {
+    let mut phys = (0.0f64, 0.0f64);
+    let mut elem = (0.0f64, 0.0f64);
+    let mut aps: Option<f64> = None;
+    let mut crit: Option<f64> = None;
+    let mut ar: Option<f64> = None;
+    let mut ev: Option<f64> = None;
+    let mut es: Option<f64> = None;
+    let mut ward: Option<f64> = None;
+    let mut block: Option<f64> = None;
+
+    for section in sections.iter().take(il_idx).skip(1) {
+        for raw_line in section.trim().lines() {
+            let line = strip_qualifier(raw_line.trim()).trim();
+            if line.starts_with("Quality:") || line.starts_with("Requires:") || line.starts_with("Sockets:") {
+                continue;
+            }
+            if let Some(v) = line.strip_prefix("Physical Damage: ") {
+                if let Some(r) = parse_damage_range(v) { phys = r; }
+            } else if let Some(v) = line.strip_prefix("Fire Damage: ")
+                    .or_else(|| line.strip_prefix("Cold Damage: "))
+                    .or_else(|| line.strip_prefix("Lightning Damage: "))
+                    .or_else(|| line.strip_prefix("Chaos Damage: ")) {
+                if let Some(r) = parse_damage_range(v) { elem.0 += r.0; elem.1 += r.1; }
+            } else if let Some(v) = line.strip_prefix("Attacks per Second: ") {
+                aps = v.trim().parse().ok();
+            } else if let Some(v) = line.strip_prefix("Critical Hit Chance: ") {
+                crit = v.trim().trim_end_matches('%').trim().parse().ok();
+            } else if let Some(v) = line.strip_prefix("Armour: ") {
+                ar = v.trim().replace(',', "").parse().ok();
+            } else if let Some(v) = line.strip_prefix("Evasion Rating: ") {
+                ev = v.trim().replace(',', "").parse().ok();
+            } else if let Some(v) = line.strip_prefix("Energy Shield: ") {
+                es = v.trim().replace(',', "").parse().ok();
+            } else if let Some(v) = line.strip_prefix("Ward: ") {
+                ward = v.trim().replace(',', "").parse().ok();
+            } else if let Some(v) = line.strip_prefix("Block Chance: ") {
+                block = v.trim().trim_end_matches('%').trim().parse().ok();
+            }
+        }
+    }
+
+    let mut stats: Vec<BaseStat> = Vec::new();
+
+    if let Some(a) = aps {
+        let pdps = (phys.0 + phys.1) / 2.0 * a;
+        let edps = (elem.0 + elem.1) / 2.0 * a;
+        let dps = pdps + edps;
+        if dps  > 0.0 { stats.push(BaseStat { id: "dps".into(),  label: "DPS".into(),           value: round1(dps) }); }
+        if pdps > 0.0 { stats.push(BaseStat { id: "pdps".into(), label: "PDPS".into(),          value: round1(pdps) }); }
+        if edps > 0.0 { stats.push(BaseStat { id: "edps".into(), label: "EDPS".into(),          value: round1(edps) }); }
+        if let Some(c) = crit { stats.push(BaseStat { id: "crit".into(), label: "Crit %".into(), value: c }); }
+        stats.push(BaseStat { id: "aps".into(), label: "APS".into(), value: a });
+    }
+
+    if let Some(v) = ar    { stats.push(BaseStat { id: "ar".into(),    label: "Armour".into(),        value: v }); }
+    if let Some(v) = ev    { stats.push(BaseStat { id: "ev".into(),    label: "Evasion".into(),        value: v }); }
+    if let Some(v) = es    { stats.push(BaseStat { id: "es".into(),    label: "Energy Shield".into(),  value: v }); }
+    if let Some(v) = ward  { stats.push(BaseStat { id: "ward".into(),  label: "Ward".into(),           value: v }); }
+    if let Some(v) = block { stats.push(BaseStat { id: "block".into(), label: "Block %".into(),        value: v }); }
+
+    stats
+}
+
+fn item_class_to_category(class: &str) -> Option<&'static str> {
+    match class {
+        "Helmets"                             => Some("armour.head"),
+        "Body Armours"                        => Some("armour.chest"),
+        "Gloves"                              => Some("armour.gloves"),
+        "Boots"                               => Some("armour.boots"),
+        "Belts"                               => Some("armour.belt"),
+        "Amulets"                             => Some("accessory.amulet"),
+        "Rings"                               => Some("accessory.ring"),
+        "Spears"                              => Some("weapon.spear"),
+        "Bows"                                => Some("weapon.bow"),
+        "Crossbows"                           => Some("weapon.crossbow"),
+        "Quarterstaves"                       => Some("weapon.quarterstaff"),
+        "Shields"                             => Some("armour.shield"),
+        "Wands"                               => Some("weapon.wand"),
+        "Sceptres"                            => Some("weapon.sceptre"),
+        "Flails"                              => Some("weapon.flail"),
+        "Foci"                                => Some("armour.focus"),
+        "Quivers"                             => Some("armour.quiver"),
+        "One Hand Swords" | "Swords"          => Some("weapon.onesword"),
+        "Two Hand Swords"                     => Some("weapon.twosword"),
+        "One Hand Axes" | "Axes"              => Some("weapon.oneaxe"),
+        "Two Hand Axes"                       => Some("weapon.twoaxe"),
+        "One Hand Maces" | "Maces" | "Clubs" => Some("weapon.onemace"),
+        "Two Hand Maces"                      => Some("weapon.twomace"),
+        "Trinkets"                            => Some("accessory.trinket"),
+        _                                     => None,
+    }
 }
 
 const INFLUENCE_TAGS: &[&str] = &[
@@ -473,24 +615,43 @@ fn parse_poe_item(text: &str) -> Option<ParsedItem> {
         })
         .unwrap_or_default();
 
+    let item_class = sections[0].lines()
+        .find_map(|l| l.strip_prefix("Item Class: "))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+
     // Sections after "Item Level:" section contain mods
     let il_idx = sections.iter().position(|s| s.contains("Item Level: "))?;
+
+    let base_stats = parse_base_stats(&sections, il_idx);
+
+    let corrupted = text.lines().any(|l| l.trim() == "Corrupted");
+
     let mut mods = Vec::new();
     for section in &sections[il_idx + 1..] {
         let trimmed = section.trim();
         if trimmed.is_empty() { continue; }
-        // Skip sections that are entirely skip-tags
+        // Skip sections that are entirely skip-tags (e.g. the "Corrupted" section)
         if trimmed.lines().all(|l| {
             let l = l.trim();
             l.is_empty() || SKIP_TAGS.iter().any(|&t| l == t)
         }) { continue; }
+        // Track mod source from PoE2 { } descriptor headers
+        let mut current_group = "explicit";
         for line in trimmed.lines() {
             let line = line.trim();
             if line.is_empty() { continue; }
             if line.starts_with('(') && line.ends_with(')') { continue; }
-            if line.starts_with('{') { continue; } // PoE2 modifier descriptor lines
+            if line.starts_with('{') {
+                current_group = if line.contains("Corruption Enhancement") { "corrupted" }
+                    else if line.contains("Implicit")    { "implicit" }
+                    else if line.contains("Enchantment") { "enchant"  }
+                    else                                  { "explicit" };
+                continue;
+            }
             if SKIP_TAGS.iter().any(|&t| line == t) { continue; }
-            if let Some(m) = parse_mod_line(line) {
+            if let Some(mut m) = parse_mod_line(line) {
+                m.mod_group = current_group.to_string();
                 mods.push(m);
             }
         }
@@ -499,9 +660,9 @@ fn parse_poe_item(text: &str) -> Option<ParsedItem> {
     if mods.is_empty() { return None; }
 
     Some(ParsedItem {
-        name, base_type,
+        name, base_type, item_class, base_stats,
         rarity: rarity_key.to_string(),
-        item_level, influence,
+        item_level, influence, corrupted,
         game_mode: detect_poe_game().to_string(),
         mods,
     })
@@ -649,6 +810,12 @@ fn start_evdev_listener(handle: tauri::AppHandle) {
                             if w.is_visible().unwrap_or(false) {
                                 eprintln!("[EW {}] Alt+D — hiding overlay", ts());
                                 let _ = w.clone().run_on_main_thread(move || {
+                                    use gtk_layer_shell::{KeyboardMode, LayerShell};
+                                    if let Ok(gtk_win) = w.gtk_window() {
+                                        // Release keyboard grab while surface is still
+                                        // mapped so KWin returns focus to PoE2.
+                                        gtk_win.set_keyboard_mode(KeyboardMode::None);
+                                    }
                                     let _ = w.hide();
                                 });
                             } else {
@@ -683,9 +850,7 @@ async fn on_alt_d(handle: &tauri::AppHandle) {
     eprintln!("[EW {}] snapshot done: {} bytes", ts(), snapshot.len());
 
     // 2. Inject Ctrl+C while overlay is still hidden.
-    //    Showing the overlay first lets WebKit briefly grab focus and intercept Ctrl+C
-    //    (copying the page URL into clipboard instead of PoE2 copying the item).
-    eprintln!("[EW {}] injecting Ctrl+C (overlay hidden)", ts());
+    eprintln!("[EW {}] injecting Ctrl+C", ts());
     {
         use evdev::{EventType, InputEvent, Key};
         let state = handle.state::<CtrlCDevice>();
@@ -696,24 +861,26 @@ async fn on_alt_d(handle: &tauri::AppHandle) {
                 ev(Key::KEY_LEFTCTRL, 1), ev(Key::KEY_C, 1),
                 ev(Key::KEY_C, 0), ev(Key::KEY_LEFTCTRL, 0),
             ]) {
-                Ok(_) => eprintln!("[EW {}] Ctrl+C emitted", ts()),
+                Ok(_)  => eprintln!("[EW {}] Ctrl+C emitted", ts()),
                 Err(e) => eprintln!("[EW {}] Ctrl+C emit error: {e}", ts()),
             }
-        } else {
-            eprintln!("[EW {}] no uinput device — skipping Ctrl+C injection", ts());
         }
     }
 
-    // 3. Now show the overlay in loading state — Ctrl+C is already in flight.
+    // 3. Show the overlay — Ctrl+C is already in flight.
     eprintln!("[EW {}] showing overlay", ts());
     let win = window.clone();
     let _ = window.clone().run_on_main_thread(move || {
+        // Stay at KeyboardMode::None — prevents WebKit from grabbing focus and
+        // intercepting the uinput Ctrl+C that's already in flight to PoE2.
+        // The frontend switches to OnDemand via set_overlay_keyboard when the
+        // user explicitly clicks a number input.
         let _ = win.show();
         let _ = win.emit("overlay-shown", ());
         let _ = win.emit("search-started", ());
     });
 
-    // 4. Poll wl-paste for PoE item content.
+    // 5. Poll wl-paste for PoE item content.
     //    - Non-PoE clipboard changes (game UI text, currency names, etc.) are logged
     //      and skipped — we update the local baseline and keep polling.
     //    - Same-item case: content never changes → fall back to original snapshot,
@@ -810,6 +977,7 @@ async fn on_alt_d(handle: &tauri::AppHandle) {
             }).collect(),
             ..item
         }
+
     } else {
         item
     };
@@ -989,7 +1157,11 @@ async fn trade_search(
     league: String,
     game_mode: String,
     currency: String,
+    item_name: String,       // non-empty only for unique items
+    item_type: String,       // non-empty when user enables base-type filter
+    corrupted: Option<bool>, // Some(true/false) to filter, None for any
     filters: Vec<StatFilter>,
+    base_filters: Vec<StatFilter>, // stat_id is "dps"/"ar"/"ilvl" etc.
     session: tauri::State<'_, PoeSession>,
 ) -> Result<TradeSearchResponse, String> {
     let (cookie_name, cookie_value) = session.0.lock().unwrap().clone();
@@ -1025,31 +1197,110 @@ async fn trade_search(
         })
         .collect();
 
-    let body = serde_json::json!({
-        "query": {
-            "filters": {
-                "trade_filters": {
-                    "filters": {
-                        "price": { "option": currency }
-                    }
-                }
-            },
-            "stats": [{ "type": "and", "filters": stat_filters }]
-        },
-        "sort": { "price": "asc" }
+    // Route base_filters into weapon_filters / armour_filters / misc_filters
+    const WEAPON_IDS: &[&str] = &["dps", "pdps", "edps", "crit", "aps"];
+    const ARMOUR_IDS: &[&str] = &["ar", "ev", "es", "ward", "block"];
+
+    let mut weapon_block = serde_json::Map::new();
+    let mut armour_block = serde_json::Map::new();
+    let mut ilvl_min: Option<f64> = None;
+
+    for f in &base_filters {
+        let id = f.stat_id.as_str();
+        if id == "ilvl" {
+            ilvl_min = f.min;
+            continue;
+        }
+        let mut val = serde_json::Map::new();
+        if let Some(min) = f.min { val.insert("min".into(), serde_json::json!(min)); }
+        if let Some(max) = f.max { val.insert("max".into(), serde_json::json!(max)); }
+        if val.is_empty() { continue; }
+        if WEAPON_IDS.contains(&id) {
+            weapon_block.insert(id.to_string(), serde_json::Value::Object(val));
+        } else if ARMOUR_IDS.contains(&id) {
+            armour_block.insert(id.to_string(), serde_json::Value::Object(val));
+        }
+    }
+
+    let mut query_filters = serde_json::json!({
+        "trade_filters": {
+            "filters": { "price": { "option": currency } }
+        }
     });
+    if game_mode == "poe2" {
+        // PoE2 API unifies weapon + defence stats under a single "equipment_filters" group
+        let mut equip_block = weapon_block.clone();
+        equip_block.extend(armour_block.clone());
+        if !equip_block.is_empty() {
+            query_filters["equipment_filters"] = serde_json::json!({ "filters": equip_block });
+        }
+    } else {
+        if !weapon_block.is_empty() {
+            query_filters["weapon_filters"] = serde_json::json!({ "filters": weapon_block });
+        }
+        if !armour_block.is_empty() {
+            query_filters["armour_filters"] = serde_json::json!({ "filters": armour_block });
+        }
+    }
+    {
+        let mut misc = serde_json::Map::new();
+        if let Some(min) = ilvl_min {
+            misc.insert("ilvl".into(), serde_json::json!({ "min": min }));
+        }
+        if let Some(corr) = corrupted {
+            misc.insert("corrupted".into(), serde_json::json!({
+                "option": if corr { "true" } else { "false" }
+            }));
+        }
+        if !misc.is_empty() {
+            query_filters["misc_filters"] = serde_json::json!({ "filters": misc });
+        }
+    }
+
+    let mut query = serde_json::json!({
+        "filters": query_filters,
+        "stats": [{ "type": "and", "filters": stat_filters }]
+    });
+    if !item_name.is_empty() {
+        query["name"] = serde_json::json!(item_name);
+    }
+    if !item_type.is_empty() {
+        query["type"] = serde_json::json!(item_type);
+    }
+
+    let body = serde_json::json!({ "query": query, "sort": { "price": "asc" } });
+    let body_str = body.to_string();
+    eprintln!("[EW] trade body: {}", &body_str[..body_str.len().min(1000)]);
 
     // POST search
     #[derive(serde::Deserialize)]
     struct SearchResp { result: Vec<String>, id: String }
 
+    async fn check_response(resp: reqwest::Response) -> Result<reqwest::Response, String> {
+        let status = resp.status();
+        if status.is_success() { return Ok(resp); }
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let secs = resp.headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(60);
+            return Err(format!("Rate limited — try again in {secs}s"));
+        }
+        let err_body = resp.text().await.unwrap_or_default();
+        eprintln!("[EW] API error {}: {}", status, &err_body[..err_body.len().min(500)]);
+        Err(format!("API error (HTTP {}) — {}", status.as_u16(), &err_body[..err_body.len().min(300)]))
+    }
+
     let mut req = client.post(format!("{base}/search/{league}"))
         .header("Content-Type", "application/json");
     if let Some(ref h) = auth_header { req = req.header("Cookie", h); }
 
-    let search: SearchResp = req.body(body.to_string())
-        .send().await.map_err(|e| format!("search request: {e}"))?
-        .json().await.map_err(|e| format!("search parse: {e}"))?;
+    let search_resp = check_response(
+        req.body(body_str).send().await.map_err(|e| format!("search request: {e}"))?
+    ).await?;
+    let search: SearchResp = search_resp.json().await
+        .map_err(|e| format!("search parse: {e}"))?;
 
     let trade_url = format!("{site_base}/search/{league}/{}", search.id);
 
@@ -1075,10 +1326,11 @@ async fn trade_search(
     let mut req = client.get(&fetch_url);
     if let Some(ref h) = auth_header { req = req.header("Cookie", h); }
 
-    let resp = req.send().await.map_err(|e| format!("fetch request: {e}"))?;
-    let body = resp.text().await.map_err(|e| format!("fetch body: {e}"))?;
-    let fetched: FetchResp = serde_json::from_str(&body)
-        .map_err(|e| format!("fetch parse: {e}\nbody: {}", &body[..body.len().min(500)]))?;
+    let fetch_text = check_response(
+        req.send().await.map_err(|e| format!("fetch request: {e}"))?
+    ).await?.text().await.map_err(|e| format!("fetch body: {e}"))?;
+    let fetched: FetchResp = serde_json::from_str(&fetch_text)
+        .map_err(|e| format!("fetch parse: {e}\nbody: {}", &fetch_text[..fetch_text.len().min(500)]))?;
 
     let results = fetched.result.into_iter().flatten()
         .filter_map(|entry| {
@@ -1251,6 +1503,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             hide_overlay,
+            set_overlay_keyboard,
             move_overlay,
             save_overlay_position,
             get_session_id,

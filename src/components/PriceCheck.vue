@@ -16,6 +16,11 @@ interface Affix {
   id: string; text: string; value: number
   min: number | null; max: number | null; enabled: boolean
   stat_id: string | null
+  mod_group: string
+}
+interface BaseStat {
+  id: string; label: string; value: number
+  min: number | null; max: number | null; enabled: boolean
 }
 interface Currency { id: string; label: string }
 interface Result {
@@ -25,7 +30,9 @@ interface Result {
 interface ItemData {
   name: string; base_type: string; rarity: string
   item_level: number; influence: string; game_mode: string
-  mods: Array<{ text: string; value: number; stat_id: string | null }>
+  item_class: string; corrupted: boolean
+  base_stats: Array<{ id: string; label: string; value: number }>
+  mods: Array<{ text: string; value: number; stat_id: string | null; mod_group: string }>
 }
 
 const gameMode = ref<GameMode>('poe1')
@@ -144,7 +151,25 @@ async function runSearch() {
       max: a.max != null ? a.max : undefined,
     }))
 
-  if (!filters.length) return
+  const baseFilters = [
+    ...item.value.baseStats
+      .filter(s => s.enabled)
+      .map(s => ({
+        stat_id: s.id,
+        min: s.min != null ? s.min : undefined,
+        max: s.max != null ? s.max : undefined,
+      })),
+    ...(item.value.ilvlEnabled && item.value.itemLevel > 0
+      ? [{ stat_id: 'ilvl', min: item.value.ilvlMin, max: undefined }]
+      : []),
+  ]
+
+  const corruptedArg = (item.value.corrupted && item.value.corruptedFilter) ? true : null
+  const itemNameArg  = item.value.rarity === 'unique' ? item.value.name : ''
+
+  const hasAnyFilter = filters.length > 0 || baseFilters.length > 0
+    || item.value.typeEnabled || corruptedArg !== null || !!itemNameArg
+  if (!hasAnyFilter) return
 
   searching.value = true
   searchError.value = ''
@@ -156,7 +181,11 @@ async function runSearch() {
       league: selectedLeague.value,
       gameMode: gameMode.value,
       currency: selectedCurrency.value,
+      itemName: itemNameArg,
+      itemType: item.value.typeEnabled ? item.value.baseType : '',
+      corrupted: corruptedArg,
       filters,
+      baseFilters,
     })
     results.value = res.results
     lastTradeUrl.value = res.trade_url
@@ -172,13 +201,24 @@ const item = ref({
   rarity: 'normal' as Rarity,
   baseType: 'Hover an item, then press Alt+D',
   itemLevel: 0,
+  itemClass: '',
   influence: '',
+  corrupted: false,
+  corruptedFilter: false,
   affixes: [] as Affix[],
+  baseStats: [] as BaseStat[],
+  typeEnabled: false,
+  ilvlEnabled: false,
+  ilvlMin: 0,
 })
 
 const results = ref<Result[]>([])
 
 const rarityClass = computed(() => `rarity-${item.value.rarity}`)
+
+const corruptedAffixes = computed(() => item.value.affixes.filter(a => a.mod_group === 'corrupted'))
+const implicitAffixes  = computed(() => item.value.affixes.filter(a => a.mod_group === 'implicit' || a.mod_group === 'enchant'))
+const explicitAffixes  = computed(() => item.value.affixes.filter(a => a.mod_group !== 'corrupted' && a.mod_group !== 'implicit' && a.mod_group !== 'enchant'))
 
 const medianPrice = computed(() => {
   if (!results.value.length) return null
@@ -198,6 +238,8 @@ function formatAffix(text: string, value: number) {
   return text.replace('#', String(value))
 }
 function handleInteract() { emit('interact') }
+function onRangeInputFocus() { handleInteract(); invoke('set_overlay_keyboard', { enabled: true }) }
+function onRangeInputBlur()  { invoke('set_overlay_keyboard', { enabled: false }) }
 
 // ── Drag to reposition ───────────────────────────────────────────────────────
 let isDragging = false
@@ -262,15 +304,30 @@ onMounted(async () => {
       rarity: payload.rarity as Rarity,
       baseType: payload.base_type,
       itemLevel: payload.item_level,
+      itemClass: payload.item_class,
       influence: payload.influence,
+      corrupted: payload.corrupted,
+      corruptedFilter: payload.corrupted,
+      baseStats: payload.base_stats.map(s => ({
+        id: s.id,
+        label: s.label,
+        value: s.value,
+        min: Math.floor(s.value * 0.8),
+        max: null,
+        enabled: true,
+      })),
+      typeEnabled: false,
+      ilvlEnabled: false,
+      ilvlMin: payload.item_level,
       affixes: payload.mods.map((mod, i) => ({
         id: String(i),
         text: mod.text,
         value: mod.value,
-        min: Math.floor(mod.value * 0.9),
-        max: Math.ceil(mod.value * 1.1),
+        min: mod.value >= 5 ? Math.floor(mod.value * 0.8) : null,
+        max: null,
         enabled: true,
         stat_id: mod.stat_id ?? null,
+        mod_group: mod.mod_group,
       })),
     }
     results.value = []
@@ -377,10 +434,20 @@ async function openTradeSite() {
         </template>
         <template v-else>
           <div :class="['item-name', rarityClass]">{{ item.name }}</div>
-          <div class="item-base">{{ item.baseType }}</div>
+          <label class="item-filter-row" @click.stop="item.typeEnabled = !item.typeEnabled; handleInteract()">
+            <input class="item-filter-cb" type="checkbox" v-model="item.typeEnabled" @click.stop />
+            <span :class="['item-base', { 'filter-active': item.typeEnabled }]">{{ item.baseType }}</span>
+          </label>
           <div class="item-meta">
-            <span>Item Level {{ item.itemLevel }}</span>
+            <label class="item-filter-row" @click.stop="item.ilvlEnabled = !item.ilvlEnabled; handleInteract()">
+              <input class="item-filter-cb" type="checkbox" v-model="item.ilvlEnabled" @click.stop />
+              <span :class="{ 'filter-active': item.ilvlEnabled }">Item Level {{ item.itemLevel }}</span>
+            </label>
             <span v-if="item.influence" class="influence">· {{ item.influence }}</span>
+            <label v-if="item.corrupted" class="item-filter-row" @click.stop="item.corruptedFilter = !item.corruptedFilter; handleInteract()">
+              <input class="item-filter-cb" type="checkbox" v-model="item.corruptedFilter" @click.stop />
+              <span :class="['corrupted-tag', { 'filter-active': item.corruptedFilter }]">Corrupted</span>
+            </label>
           </div>
         </template>
       </div>
@@ -408,14 +475,112 @@ async function openTradeSite() {
       </div>
     </div>
 
+    <template v-if="item.baseStats.length">
+      <div class="sep" />
+
+      <!-- ── Item Filters ───────────────────────────────── -->
+      <div class="section">
+        <div class="section-title">ITEM FILTERS</div>
+
+        <label
+          v-for="stat in item.baseStats"
+          :key="stat.id"
+          class="affix-row"
+          @click="handleInteract"
+        >
+          <input class="affix-checkbox" type="checkbox" v-model="stat.enabled" />
+          <span :class="['affix-text', { dimmed: !stat.enabled }]">{{ stat.label }}</span>
+          <div class="affix-range">
+            <input
+              class="range-input"
+              type="number"
+              placeholder="min"
+              v-model.number="stat.min"
+              :disabled="!stat.enabled"
+              @focus="onRangeInputFocus"
+              @blur="onRangeInputBlur"
+              @click.stop
+            />
+            <input
+              class="range-input"
+              type="number"
+              placeholder="max"
+              v-model.number="stat.max"
+              :disabled="!stat.enabled"
+              @focus="onRangeInputFocus"
+              @blur="onRangeInputBlur"
+              @click.stop
+            />
+          </div>
+        </label>
+      </div>
+    </template>
+
     <div class="sep" />
 
     <!-- ── Affixes ─────────────────────────────────────── -->
     <div class="section">
+      <!-- Corruption implicits sub-group -->
+      <template v-if="corruptedAffixes.length">
+        <div class="section-title">CORRUPTION IMPLICITS</div>
+        <div class="affix-list" :class="{ 'affix-loading': searching }">
+          <label
+            v-for="affix in corruptedAffixes"
+            v-show="!searching"
+            :key="affix.id"
+            class="affix-row"
+            @click="handleInteract"
+          >
+            <input class="affix-checkbox" type="checkbox" v-model="affix.enabled" />
+            <span :class="['affix-text', { dimmed: !affix.enabled }]">
+              {{ formatAffix(affix.text, affix.value) }}
+            </span>
+            <div class="affix-range">
+              <input class="range-input" type="number" placeholder="min"
+                v-model.number="affix.min" :disabled="!affix.enabled"
+                @focus="onRangeInputFocus" @blur="onRangeInputBlur" @click.stop />
+              <input class="range-input" type="number" placeholder="max"
+                v-model.number="affix.max" :disabled="!affix.enabled"
+                @focus="onRangeInputFocus" @blur="onRangeInputBlur" @click.stop />
+            </div>
+          </label>
+        </div>
+        <div v-if="implicitAffixes.length || explicitAffixes.length" class="subsep" />
+      </template>
+
+      <!-- Implicit sub-group -->
+      <template v-if="implicitAffixes.length">
+        <div class="section-title">IMPLICITS</div>
+        <div class="affix-list" :class="{ 'affix-loading': searching }">
+          <label
+            v-for="affix in implicitAffixes"
+            v-show="!searching"
+            :key="affix.id"
+            class="affix-row"
+            @click="handleInteract"
+          >
+            <input class="affix-checkbox" type="checkbox" v-model="affix.enabled" />
+            <span :class="['affix-text', { dimmed: !affix.enabled }]">
+              {{ formatAffix(affix.text, affix.value) }}
+            </span>
+            <div class="affix-range">
+              <input class="range-input" type="number" placeholder="min"
+                v-model.number="affix.min" :disabled="!affix.enabled"
+                @focus="onRangeInputFocus" @blur="onRangeInputBlur" @click.stop />
+              <input class="range-input" type="number" placeholder="max"
+                v-model.number="affix.max" :disabled="!affix.enabled"
+                @focus="onRangeInputFocus" @blur="onRangeInputBlur" @click.stop />
+            </div>
+          </label>
+        </div>
+        <div v-if="explicitAffixes.length" class="subsep" />
+      </template>
+
+      <!-- Explicit affixes -->
       <div class="section-title">AFFIXES</div>
       <div class="affix-list" :class="{ 'affix-loading': searching }">
         <label
-          v-for="affix in item.affixes"
+          v-for="affix in explicitAffixes"
           v-show="!searching"
           :key="affix.id"
           class="affix-row"
@@ -426,24 +591,12 @@ async function openTradeSite() {
             {{ formatAffix(affix.text, affix.value) }}
           </span>
           <div class="affix-range">
-            <input
-              class="range-input"
-              type="number"
-              placeholder="min"
-              v-model.number="affix.min"
-              :disabled="!affix.enabled"
-              @focus="handleInteract"
-              @click.stop
-            />
-            <input
-              class="range-input"
-              type="number"
-              placeholder="max"
-              v-model.number="affix.max"
-              :disabled="!affix.enabled"
-              @focus="handleInteract"
-              @click.stop
-            />
+            <input class="range-input" type="number" placeholder="min"
+              v-model.number="affix.min" :disabled="!affix.enabled"
+              @focus="onRangeInputFocus" @blur="onRangeInputBlur" @click.stop />
+            <input class="range-input" type="number" placeholder="max"
+              v-model.number="affix.max" :disabled="!affix.enabled"
+              @focus="onRangeInputFocus" @blur="onRangeInputBlur" @click.stop />
           </div>
         </label>
       </div>
@@ -679,6 +832,23 @@ async function openTradeSite() {
 .rarity-unique { color: var(--unique); }
 .rarity-normal { color: var(--normal); }
 
+.item-filter-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  user-select: none;
+}
+.item-filter-cb {
+  width: 10px;
+  height: 10px;
+  flex-shrink: 0;
+  margin: 0;
+  cursor: pointer;
+  accent-color: var(--accent);
+}
+.filter-active { color: var(--accent) !important; }
+
 .item-base {
   font-size: 12px;
   color: var(--text-muted);
@@ -691,8 +861,14 @@ async function openTradeSite() {
   font-size: 11px;
   color: var(--text-muted);
   margin-top: 4px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 .influence { color: var(--currency); }
+.corrupted-tag { color: #b74545; }
+.corrupted-tag.filter-active { color: #ff6b6b !important; }
+.subsep { height: 1px; background: var(--border); margin: 4px 0 6px; opacity: 0.4; }
 
 .item-info-right {
   flex-shrink: 0;
