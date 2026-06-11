@@ -583,7 +583,7 @@ fn parse_base_stats(sections: &[&str], il_idx: usize) -> Vec<BaseStat> {
 
 fn item_class_to_category(class: &str) -> Option<&'static str> {
     match class {
-        "Helmets"                             => Some("armour.head"),
+        "Helmets"                             => Some("armour.helmet"),
         "Body Armours"                        => Some("armour.chest"),
         "Gloves"                              => Some("armour.gloves"),
         "Boots"                               => Some("armour.boots"),
@@ -1345,13 +1345,7 @@ async fn trade_search(
         }
     }
 
-    let mut trade_inner = serde_json::json!({ "price": { "option": currency } });
-    // "In Person" = stash-tab trade, seller must be online to whisper.
-    // "IOB" = Ange's store purchase, no online requirement — no account filter needed.
-    // "Both" = show all listings.
-    if buyout_type == "inperson" {
-        trade_inner["account"] = serde_json::json!({ "option": "online" });
-    }
+    let trade_inner = serde_json::json!({ "price": { "option": currency } });
     let mut query_filters = serde_json::json!({
         "trade_filters": { "filters": trade_inner }
     });
@@ -1364,9 +1358,13 @@ async fn trade_search(
         });
     }
     if game_mode == "poe2" {
-        // PoE2 API unifies weapon + defence stats under a single "equipment_filters" group
+        // PoE2 API unifies weapon + defence stats under a single "equipment_filters" group.
+        // Augment socket count goes here as "rune_sockets".
         let mut equip_block = weapon_block.clone();
         equip_block.extend(armour_block.clone());
+        if let Some(min) = sockets_min {
+            equip_block.insert("rune_sockets".into(), serde_json::json!({ "min": min as u32 }));
+        }
         if !equip_block.is_empty() {
             query_filters["equipment_filters"] = serde_json::json!({ "filters": equip_block });
         }
@@ -1386,9 +1384,6 @@ async fn trade_search(
         if let Some(min) = gem_level_min {
             misc.insert("gem_level".into(), serde_json::json!({ "min": min }));
         }
-        if let Some(min) = sockets_min {
-            misc.insert("sockets".into(), serde_json::json!({ "min": min }));
-        }
         if let Some(corr) = corrupted {
             misc.insert("corrupted".into(), serde_json::json!({
                 "option": if corr { "true" } else { "false" }
@@ -1403,6 +1398,12 @@ async fn trade_search(
         "filters": query_filters,
         "stats": [{ "type": "and", "filters": stat_filters }]
     });
+    // status is a top-level query field, not inside trade_filters
+    query["status"] = serde_json::json!({ "option": match buyout_type.as_str() {
+        "iob"      => "securable",
+        "inperson" => "online",
+        _          => "any",
+    }});
     if !item_name.is_empty() {
         query["name"] = serde_json::json!(item_name);
     }

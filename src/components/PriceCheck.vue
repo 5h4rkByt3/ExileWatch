@@ -360,6 +360,8 @@ onMounted(async () => {
 
   unlisteners.push(await listen<ItemData>('item-data', ({ payload }) => {
     searching.value = false
+    results.value = []
+    searchError.value = ''
     const newMode = payload.game_mode as GameMode
     if (newMode !== gameMode.value) setGameMode(newMode)
 
