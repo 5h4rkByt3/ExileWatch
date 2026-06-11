@@ -15,16 +15,17 @@ interface League { id: string; text: string }
 interface Affix {
   id: string; text: string; value: number
   min: number | null; max: number | null; enabled: boolean
+  stat_id: string | null
 }
 interface Currency { id: string; label: string }
 interface Result {
   price: number; currency: string; seller: string
-  status: 'online' | 'afk' | 'offline'; stock: number
+  status: 'online' | 'afk' | 'offline'
 }
 interface ItemData {
   name: string; base_type: string; rarity: string
   item_level: number; influence: string; game_mode: string
-  mods: Array<{ text: string; value: number }>
+  mods: Array<{ text: string; value: number; stat_id: string | null }>
 }
 
 const gameMode = ref<GameMode>('poe1')
@@ -60,6 +61,11 @@ function onLeagueChange(e: Event) {
   handleInteract()
 }
 
+function onCurrencyChange() {
+  localStorage.setItem(`${gameMode.value}_currency`, selectedCurrency.value)
+  handleInteract()
+}
+
 watch(gameMode, loadLeagues)
 
 const POE1_CURRENCIES: Currency[] = [
@@ -82,7 +88,13 @@ const POE2_CURRENCIES: Currency[] = [
 const currencies = computed(() =>
   gameMode.value === 'poe1' ? POE1_CURRENCIES : POE2_CURRENCIES
 )
-const selectedCurrency = ref('chaos')
+function savedCurrency(mode: GameMode): string {
+  const saved = localStorage.getItem(`${mode}_currency`)
+  const list = mode === 'poe1' ? POE1_CURRENCIES : POE2_CURRENCIES
+  return list.find(c => c.id === saved)?.id ?? (mode === 'poe1' ? 'chaos' : 'exalted')
+}
+
+const selectedCurrency = ref(savedCurrency('poe1'))
 
 const showSettings     = ref(false)
 const sessionInput     = ref('')
@@ -120,6 +132,40 @@ async function saveSession() {
 }
 
 const searching = ref(false)
+const searchError = ref('')
+const lastTradeUrl = ref('')
+
+async function runSearch() {
+  const filters = item.value.affixes
+    .filter(a => a.enabled && a.stat_id)
+    .map(a => ({
+      stat_id: a.stat_id!,
+      min: a.min != null ? a.min : undefined,
+      max: a.max != null ? a.max : undefined,
+    }))
+
+  if (!filters.length) return
+
+  searching.value = true
+  searchError.value = ''
+  results.value = []
+  handleInteract()
+
+  try {
+    const res = await invoke<{ results: Result[]; trade_url: string }>('trade_search', {
+      league: selectedLeague.value,
+      gameMode: gameMode.value,
+      currency: selectedCurrency.value,
+      filters,
+    })
+    results.value = res.results
+    lastTradeUrl.value = res.trade_url
+  } catch (e) {
+    searchError.value = String(e)
+  } finally {
+    searching.value = false
+  }
+}
 
 const item = ref({
   name: '—',
@@ -145,7 +191,7 @@ const medianPrice = computed(() => {
 const medianCurrency = computed(() => results.value[0]?.currency ?? 'c')
 
 function setGameMode(mode: GameMode) {
-  selectedCurrency.value = mode === 'poe1' ? 'chaos' : 'exalted'
+  selectedCurrency.value = savedCurrency(mode)
   gameMode.value = mode  // triggers watch(gameMode, loadLeagues)
 }
 function formatAffix(text: string, value: number) {
@@ -204,6 +250,7 @@ onMounted(async () => {
   unlisteners.push(await listen('search-started', () => {
     searching.value = true
     results.value = []
+    lastTradeUrl.value = ''
   }))
 
   unlisteners.push(await listen<ItemData>('item-data', ({ payload }) => {
@@ -223,6 +270,7 @@ onMounted(async () => {
         min: Math.floor(mod.value * 0.9),
         max: Math.ceil(mod.value * 1.1),
         enabled: true,
+        stat_id: mod.stat_id ?? null,
       })),
     }
     results.value = []
@@ -238,6 +286,11 @@ onUnmounted(() => {
 
 async function openTradeSite() {
   handleInteract()
+  if (lastTradeUrl.value) {
+    await openUrl(lastTradeUrl.value)
+    return
+  }
+  // Fallback: open the league search page with no query
   const league = encodeURIComponent(selectedLeague.value || 'Standard')
   const url = gameMode.value === 'poe1'
     ? `https://www.pathofexile.com/trade/search/${league}`
@@ -316,18 +369,43 @@ async function openTradeSite() {
 
     <!-- ── Item Info ───────────────────────────────────── -->
     <div class="item-info">
-      <template v-if="searching">
-        <div class="searching-label">Searching<span class="searching-dots"></span></div>
-        <div class="item-base searching-sub">reading clipboard...</div>
-      </template>
-      <template v-else>
-        <div :class="['item-name', rarityClass]">{{ item.name }}</div>
-        <div class="item-base">{{ item.baseType }}</div>
-        <div class="item-meta">
-          <span>Item Level {{ item.itemLevel }}</span>
-          <span v-if="item.influence" class="influence">· {{ item.influence }}</span>
+      <!-- Left: name / type / level -->
+      <div class="item-info-left">
+        <template v-if="searching">
+          <div class="searching-label">Searching<span class="searching-dots"></span></div>
+          <div class="item-base searching-sub">reading clipboard...</div>
+        </template>
+        <template v-else>
+          <div :class="['item-name', rarityClass]">{{ item.name }}</div>
+          <div class="item-base">{{ item.baseType }}</div>
+          <div class="item-meta">
+            <span>Item Level {{ item.itemLevel }}</span>
+            <span v-if="item.influence" class="influence">· {{ item.influence }}</span>
+          </div>
+        </template>
+      </div>
+      <!-- Right: league / currency -->
+      <div class="item-info-right">
+        <div class="info-select-row">
+          <span class="info-select-label">League</span>
+          <select
+            class="info-select"
+            :value="selectedLeague"
+            :disabled="loadingLeagues"
+            :class="{ 'select-loading': loadingLeagues }"
+            @change="onLeagueChange"
+          >
+            <option v-if="loadingLeagues" value="" disabled>…</option>
+            <option v-for="l in leagues" :key="l.id" :value="l.id">{{ l.text }}</option>
+          </select>
         </div>
-      </template>
+        <div class="info-select-row">
+          <span class="info-select-label">Currency</span>
+          <select class="info-select" v-model="selectedCurrency" @change="onCurrencyChange">
+            <option v-for="c in currencies" :key="c.id" :value="c.id">{{ c.label }}</option>
+          </select>
+        </div>
+      </div>
     </div>
 
     <div class="sep" />
@@ -380,32 +458,13 @@ async function openTradeSite() {
         <button :class="['opt-btn', { active: buyoutType === 'inperson' }]" @click="buyoutType = 'inperson'">In Person</button>
         <button :class="['opt-btn', { active: buyoutType === 'both' }]"     @click="buyoutType = 'both'">Both</button>
       </div>
-      <div class="currency-row">
-        <span class="field-label">League</span>
-        <select
-          class="currency-select"
-          :value="selectedLeague"
-          :disabled="loadingLeagues"
-          :class="{ 'select-loading': loadingLeagues }"
-          @change="onLeagueChange"
-        >
-          <option v-if="loadingLeagues" value="" disabled>Loading...</option>
-          <option v-for="l in leagues" :key="l.id" :value="l.id">{{ l.text }}</option>
-        </select>
-      </div>
-      <div class="currency-row">
-        <span class="field-label">Currency</span>
-        <select class="currency-select" v-model="selectedCurrency" @change="handleInteract">
-          <option v-for="c in currencies" :key="c.id" :value="c.id">{{ c.label }}</option>
-        </select>
-      </div>
     </div>
 
     <div class="sep" />
 
     <!-- ── Actions ────────────────────────────────────── -->
     <div class="actions">
-      <button class="action-btn primary" @click="handleInteract">Search</button>
+      <button class="action-btn primary" @click="runSearch" :disabled="searching">Search</button>
       <button class="action-btn secondary" @click="openTradeSite">Open Trade Site ↗</button>
     </div>
 
@@ -420,14 +479,16 @@ async function openTradeSite() {
           <span class="median-curr"> {{ medianCurrency }}</span>
         </span>
       </div>
-      <div class="results-list">
+      <div v-if="searchError" class="search-error">{{ searchError }}</div>
+      <div v-else-if="searching" class="results-loading">Searching…</div>
+      <div v-else class="results-list">
+        <div v-if="!results.length && medianPrice === null" class="results-empty">No results</div>
         <div v-for="(r, i) in results" :key="i" class="result-row">
           <span class="result-price">
-            {{ r.price }}<span class="result-curr"> c</span>
+            {{ r.price }} <span class="result-curr">{{ r.currency.charAt(0).toUpperCase() + r.currency.slice(1) }}</span>
           </span>
           <span class="result-seller">{{ r.seller }}</span>
           <span :class="['result-dot', `dot-${r.status}`]">●</span>
-          <span class="result-stock">{{ r.stock }}×</span>
         </div>
       </div>
     </div>
@@ -596,12 +657,22 @@ async function openTradeSite() {
 .item-info {
   padding: 12px 16px 10px;
   flex-shrink: 0;
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+}
+.item-info-left {
+  flex: 1;
+  min-width: 0; /* allows text-overflow to work */
 }
 .item-name {
   font-size: 17px;
   font-weight: 700;
   letter-spacing: 0.03em;
   line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .rarity-rare   { color: var(--rare); text-shadow: 0 0 12px rgba(255,215,0,0.3); }
 .rarity-magic  { color: var(--magic); }
@@ -612,6 +683,9 @@ async function openTradeSite() {
   font-size: 12px;
   color: var(--text-muted);
   margin-top: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .item-meta {
   font-size: 11px;
@@ -619,6 +693,48 @@ async function openTradeSite() {
   margin-top: 4px;
 }
 .influence { color: var(--currency); }
+
+.item-info-right {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  align-items: flex-end;
+}
+.info-select-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.info-select-label {
+  font-size: 10px;
+  color: var(--text-label);
+  white-space: nowrap;
+}
+.info-select {
+  background: var(--bg-input);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5'%3E%3Cpath d='M0 0l4 5 4-5z' fill='%236a6658'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 6px center;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  padding: 3px 22px 3px 5px;
+  border-radius: 3px;
+  max-width: 110px;
+  cursor: pointer;
+  transition: all 0.15s;
+  -webkit-appearance: none;
+  appearance: none;
+}
+.info-select:hover { border-color: var(--accent-dim); color: var(--text); }
+.info-select:focus { outline: none; border-color: var(--accent-dim); color: var(--text); }
+.info-select option {
+  background: var(--bg-input);
+  color: var(--text);
+}
 
 /* ── Separator ───────────────────────────────────────── */
 .sep {
@@ -721,25 +837,6 @@ async function openTradeSite() {
 .opt-btn:hover  { border-color: var(--accent-dim); color: var(--text); }
 .opt-btn.active { border-color: var(--accent); color: var(--accent); background: rgba(200,168,75,0.1); }
 
-.currency-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-.field-label { font-size: 11px; color: var(--text-label); white-space: nowrap; }
-.currency-select {
-  flex: 1;
-  padding: 4px 8px;
-  font-size: 12px;
-  background: var(--bg-input);
-  border: 1px solid var(--border-input);
-  border-radius: 3px;
-  color: var(--currency);
-  outline: none;
-  cursor: pointer;
-  appearance: auto;
-}
-.currency-select:focus { border-color: var(--accent-dim); }
 .select-loading { opacity: 0.5; cursor: not-allowed; }
 
 /* ── Actions ─────────────────────────────────────────── */
@@ -818,12 +915,11 @@ async function openTradeSite() {
 
 .result-price { font-weight: 700; color: var(--currency); white-space: nowrap; min-width: 40px; }
 .result-curr  { font-weight: 400; font-size: 10px; color: var(--text-muted); }
-.result-seller { flex: 1; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.result-seller { flex: 1; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
 .result-dot { font-size: 9px; flex-shrink: 0; }
 .dot-online  { color: var(--online); }
 .dot-afk     { color: var(--afk); }
 .dot-offline { color: var(--offline); }
-.result-stock { font-size: 11px; color: var(--text-muted); flex-shrink: 0; min-width: 22px; text-align: right; }
 
 /* ── Loading state ───────────────────────────────────── */
 .searching-label {

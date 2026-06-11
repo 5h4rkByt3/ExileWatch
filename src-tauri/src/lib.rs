@@ -21,7 +21,16 @@ struct CtrlCDevice(Mutex<Option<evdev::uinput::VirtualDevice>>);
 struct ParsedMod {
     text: String,
     value: f64,
+    stat_id: Option<String>,
 }
+
+#[derive(serde::Deserialize, Clone)]
+struct StatEntry {
+    id: String,
+    text: String,
+}
+
+struct StatCache(Mutex<std::collections::HashMap<String, Vec<StatEntry>>>);
 
 #[derive(serde::Serialize, Clone)]
 struct ParsedItem {
@@ -248,6 +257,127 @@ fn numbers_to_hash(s: &str) -> String {
     out
 }
 
+// Strip trailing qualifier annotations like "(augmented)", "(crafted)", "(fractured)".
+// These only appear in PoE clipboard text, never in GGG stat text.
+fn strip_qualifier(s: &str) -> &str {
+    let s = s.trim();
+    if let Some(rest) = s.strip_suffix(')') {
+        if let Some(pos) = rest.rfind('(') {
+            let inner = &rest[pos + 1..];
+            if !inner.is_empty() && inner.chars().all(|c| c.is_alphabetic() || c == ' ') {
+                return rest[..pos].trim_end();
+            }
+        }
+    }
+    s
+}
+
+// Strip inline roll-range annotations before numbers are hashed.
+// Handles both "(10-15)" (PoE1) and "(-17-+17)" (PoE2 signed ranges).
+// Pattern: '(' [-+]? digits '-' [-+]? digits ')'
+// Must run on raw clipboard text (before numbers_to_hash) because it matches digits.
+fn strip_roll_ranges(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '(' {
+            let start = i;
+            let mut j = i + 1;
+            // Optional sign on first number
+            if j < chars.len() && (chars[j] == '-' || chars[j] == '+') { j += 1; }
+            let n1 = j;
+            while j < chars.len() && chars[j].is_ascii_digit() { j += 1; }
+            if j > n1 && j < chars.len() && chars[j] == '-' {
+                j += 1;
+                // Optional sign on second number
+                if j < chars.len() && (chars[j] == '+' || chars[j] == '-') { j += 1; }
+                let n2 = j;
+                while j < chars.len() && chars[j].is_ascii_digit() { j += 1; }
+                if j > n2 && j < chars.len() && chars[j] == ')' {
+                    i = j + 1; // skip the range entirely
+                    continue;
+                }
+            }
+            // Not a range — emit the '(' and resume from char after it
+            out.push('(');
+            i = start + 1;
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+fn find_stat<'a>(needle: &str, entries: &'a [StatEntry]) -> Option<&'a StatEntry> {
+    entries.iter().find(|e| e.text.trim().to_lowercase() == needle)
+}
+
+fn match_stat_id(mod_text: &str, entries: &[StatEntry]) -> Option<String> {
+    let needle = mod_text.trim().to_lowercase();
+
+    // 1. Exact match
+    if let Some(e) = find_stat(&needle, entries) { return Some(e.id.clone()); }
+
+    // 2. PoE2: "+# to X"  →  "+# total X"  (life, mana, energy shield…)
+    if let Some(rest) = needle.strip_prefix("+# to ") {
+        let candidate = format!("+# total {rest}");
+        if let Some(e) = find_stat(&candidate, entries) { return Some(e.id.clone()); }
+    }
+
+    // 3. PoE2: "+#% to X"  →  "+#% total to X"  (resistances)
+    if let Some(rest) = needle.strip_prefix("+#% to ") {
+        let candidate = format!("+#% total to {rest}");
+        if let Some(e) = find_stat(&candidate, entries) { return Some(e.id.clone()); }
+    }
+
+    // 4. PoE2: "#% to X"  →  "#% total to X"
+    if let Some(rest) = needle.strip_prefix("#% to ") {
+        let candidate = format!("#% total to {rest}");
+        if let Some(e) = find_stat(&candidate, entries) { return Some(e.id.clone()); }
+    }
+
+    // 5. GGG omits leading '+' on some stats (e.g. "+# to Spirit" → "# to Spirit")
+    if let Some(rest) = needle.strip_prefix('+') {
+        if let Some(e) = find_stat(rest, entries) { return Some(e.id.clone()); }
+    }
+
+    None
+}
+
+async fn load_stats(game_mode: &str, cookie_name: &str, cookie_value: &str) -> Result<Vec<StatEntry>, String> {
+    let url = if game_mode == "poe2" {
+        "https://www.pathofexile.com/api/trade2/data/stats"
+    } else {
+        "https://www.pathofexile.com/api/trade/data/stats"
+    };
+
+    #[derive(serde::Deserialize)]
+    struct Group { entries: Vec<StatEntry> }
+    #[derive(serde::Deserialize)]
+    struct Resp { result: Vec<Group> }
+
+    let client = reqwest::Client::builder()
+        .user_agent("ExileWatch/0.1")
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let mut req = client.get(url);
+    if !cookie_value.is_empty() {
+        req = req.header("Cookie", format!("{cookie_name}={cookie_value}"));
+    }
+
+    req.send()
+        .await
+        .map_err(|e| format!("network: {e}"))?
+        .json::<Resp>()
+        .await
+        .map_err(|e| format!("parse: {e}"))
+        .map(|r| r.result.into_iter().flat_map(|g| g.entries).collect())
+}
+
 fn is_adds_range_mod(line: &str) -> bool {
     // "Adds 14 to 28 Lightning Damage" — the token after "to" is a bare number.
     // "+14 to Strength" — the token after "to" is a word, so NOT a range mod.
@@ -258,18 +388,24 @@ fn is_adds_range_mod(line: &str) -> bool {
 }
 
 fn parse_mod_line(line: &str) -> Option<ParsedMod> {
+    // Normalise before collecting numbers: strip trailing qualifiers like
+    // "(augmented)" and inline roll ranges like "(10-15)" while digits are still digits.
+    let line = strip_qualifier(line);
+    let stripped = strip_roll_ranges(line);
+    let line = stripped.trim();
+
     let nums = collect_numbers(line);
     if nums.is_empty() {
         return None;
     }
     // Two-value range mods like "Adds 14 to 28 Lightning Damage" → average.
-    // Single-value mods like "+14(10-15) to Strength" → first number (the roll).
+    // Single-value mods like "+14 to Strength" → the roll.
     let value = if nums.len() >= 2 && is_adds_range_mod(line) {
         (nums[0].abs() + nums[1].abs()) / 2.0
     } else {
         nums[0].abs()
     };
-    Some(ParsedMod { text: numbers_to_hash(line), value })
+    Some(ParsedMod { text: numbers_to_hash(line), value, stat_id: None })
 }
 
 const INFLUENCE_TAGS: &[&str] = &[
@@ -644,6 +780,40 @@ async fn on_alt_d(handle: &tauri::AppHandle) {
     };
 
     eprintln!("[EW {}] parsed: \"{}\" rarity={} ilvl={} {} mods  game={}", ts(), item.name, item.rarity, item.item_level, item.mods.len(), item.game_mode);
+
+    // Resolve stat IDs — fetch on first use per game mode, then serve from cache.
+    let stat_entries: Option<Vec<StatEntry>> = {
+        let cache = handle.state::<StatCache>();
+        let cached = cache.0.lock().unwrap().get(&item.game_mode).cloned();
+        if cached.is_some() {
+            cached
+        } else {
+            let (cname, cval) = handle.state::<PoeSession>().0.lock().unwrap().clone();
+            match load_stats(&item.game_mode, &cname, &cval).await {
+                Ok(entries) => {
+                    eprintln!("[EW {}] cached {} stat entries for {}", ts(), entries.len(), item.game_mode);
+                    cache.0.lock().unwrap().insert(item.game_mode.clone(), entries.clone());
+                    Some(entries)
+                }
+                Err(e) => { eprintln!("[EW {}] stat load failed: {e}", ts()); None }
+            }
+        }
+    };
+
+    let item = if let Some(ref entries) = stat_entries {
+        let matched: usize = item.mods.iter().filter(|m| match_stat_id(&m.text, entries).is_some()).count();
+        eprintln!("[EW {}] stat match: {}/{} mods resolved", ts(), matched, item.mods.len());
+        ParsedItem {
+            mods: item.mods.into_iter().map(|m| {
+                let sid = match_stat_id(&m.text, entries);
+                ParsedMod { stat_id: sid, ..m }
+            }).collect(),
+            ..item
+        }
+    } else {
+        item
+    };
+
     eprintln!("[EW {}] emitting item-data", ts());
     let _ = window.emit("item-data", &item);
 }
@@ -793,6 +963,145 @@ fn read_firefox_session() -> Result<(String, String), String> {
     }
 }
 
+#[derive(serde::Deserialize)]
+struct StatFilter {
+    stat_id: String,
+    min: Option<f64>,
+    max: Option<f64>,
+}
+
+#[derive(serde::Serialize)]
+struct TradeResult {
+    price: f64,
+    currency: String,
+    seller: String,
+    status: String,
+}
+
+#[derive(serde::Serialize)]
+struct TradeSearchResponse {
+    results: Vec<TradeResult>,
+    trade_url: String,
+}
+
+#[tauri::command]
+async fn trade_search(
+    league: String,
+    game_mode: String,
+    currency: String,
+    filters: Vec<StatFilter>,
+    session: tauri::State<'_, PoeSession>,
+) -> Result<TradeSearchResponse, String> {
+    let (cookie_name, cookie_value) = session.0.lock().unwrap().clone();
+
+    let (base, site_base) = if game_mode == "poe2" {
+        ("https://www.pathofexile.com/api/trade2", "https://www.pathofexile.com/trade2")
+    } else {
+        ("https://www.pathofexile.com/api/trade", "https://www.pathofexile.com/trade")
+    };
+
+    let client = reqwest::Client::builder()
+        .user_agent("ExileWatch/0.1")
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let auth_header = if cookie_value.is_empty() {
+        None
+    } else {
+        Some(format!("{cookie_name}={cookie_value}"))
+    };
+
+    // Build stat filters — skip any mod without a resolved stat_id
+    let stat_filters: Vec<serde_json::Value> = filters.iter()
+        .filter(|f| !f.stat_id.is_empty())
+        .map(|f| {
+            let mut entry = serde_json::json!({ "id": f.stat_id });
+            let mut val = serde_json::Map::new();
+            if let Some(min) = f.min { val.insert("min".into(), serde_json::json!(min)); }
+            if let Some(max) = f.max { val.insert("max".into(), serde_json::json!(max)); }
+            if !val.is_empty() { entry["value"] = serde_json::Value::Object(val); }
+            entry
+        })
+        .collect();
+
+    let body = serde_json::json!({
+        "query": {
+            "filters": {
+                "trade_filters": {
+                    "filters": {
+                        "price": { "option": currency }
+                    }
+                }
+            },
+            "stats": [{ "type": "and", "filters": stat_filters }]
+        },
+        "sort": { "price": "asc" }
+    });
+
+    // POST search
+    #[derive(serde::Deserialize)]
+    struct SearchResp { result: Vec<String>, id: String }
+
+    let mut req = client.post(format!("{base}/search/{league}"))
+        .header("Content-Type", "application/json");
+    if let Some(ref h) = auth_header { req = req.header("Cookie", h); }
+
+    let search: SearchResp = req.body(body.to_string())
+        .send().await.map_err(|e| format!("search request: {e}"))?
+        .json().await.map_err(|e| format!("search parse: {e}"))?;
+
+    let trade_url = format!("{site_base}/search/{league}/{}", search.id);
+
+    if search.result.is_empty() {
+        return Ok(TradeSearchResponse { results: vec![], trade_url });
+    }
+
+    // GET fetch (first 10 results)
+    let ids = search.result[..search.result.len().min(10)].join(",");
+    let fetch_url = format!("{base}/fetch/{ids}?query={}", search.id);
+
+    #[derive(serde::Deserialize)]
+    struct Price { amount: f64, currency: String }
+    #[derive(serde::Deserialize)]
+    struct Account { name: String, online: Option<serde_json::Value> }
+    #[derive(serde::Deserialize)]
+    struct Listing { price: Option<Price>, account: Account }
+    #[derive(serde::Deserialize)]
+    struct FetchEntry { listing: Listing }
+    #[derive(serde::Deserialize)]
+    struct FetchResp { result: Vec<Option<FetchEntry>> }
+
+    let mut req = client.get(&fetch_url);
+    if let Some(ref h) = auth_header { req = req.header("Cookie", h); }
+
+    let resp = req.send().await.map_err(|e| format!("fetch request: {e}"))?;
+    let body = resp.text().await.map_err(|e| format!("fetch body: {e}"))?;
+    let fetched: FetchResp = serde_json::from_str(&body)
+        .map_err(|e| format!("fetch parse: {e}\nbody: {}", &body[..body.len().min(500)]))?;
+
+    let results = fetched.result.into_iter().flatten()
+        .filter_map(|entry| {
+            let price = entry.listing.price?;
+            // online can be: null → offline, false → offline, {status:"afk"} → afk, {status:"online"} → online
+            let status = match entry.listing.account.online.as_ref() {
+                Some(serde_json::Value::Object(obj))
+                    if obj.get("status").and_then(|s| s.as_str()) == Some("afk") => "afk",
+                Some(serde_json::Value::Object(_)) => "online",
+                _ => "offline",
+            }.to_string();
+            Some(TradeResult {
+                price: price.amount,
+                currency: price.currency,
+                seller: entry.listing.account.name,
+                status,
+            })
+        })
+        .collect();
+
+    Ok(TradeSearchResponse { results, trade_url })
+}
+
 #[tauri::command]
 async fn read_browser_session(
     state: tauri::State<'_, PoeSession>,
@@ -909,6 +1218,7 @@ pub fn run() {
             let saved = load_saved_position(app);
             let (sname, svalue) = load_saved_config(app);
             app.manage(PoeSession(Mutex::new((sname, svalue))));
+            app.manage(StatCache(Mutex::new(std::collections::HashMap::new())));
 
             if let Some(window) = app.get_webview_window("main") {
                 #[cfg(target_os = "linux")]
@@ -947,6 +1257,7 @@ pub fn run() {
             set_session_id,
             read_browser_session,
             fetch_leagues,
+            trade_search,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
