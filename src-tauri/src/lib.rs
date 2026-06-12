@@ -33,6 +33,19 @@ struct StatEntry {
 }
 
 struct StatCache(Mutex<std::collections::HashMap<String, Vec<StatEntry>>>);
+struct KeybindCode(std::sync::Arc<Mutex<String>>);
+// -1 = auto (cursor-based), >= 0 = explicit GDK monitor index chosen by user
+struct MonitorPref(Mutex<i32>);
+
+#[derive(serde::Serialize, Clone)]
+struct MonitorInfo {
+    index: i32,
+    name: String,
+    width: i32,
+    height: i32,
+    x: i32,
+    y: i32,
+}
 
 #[derive(serde::Serialize, Clone)]
 struct BaseStat {
@@ -129,26 +142,46 @@ fn save_overlay_position(state: tauri::State<OverlayPos>, app: tauri::AppHandle)
 const KEYRING_SERVICE: &str = "io.github.5h4rkbyt3.exilewatch";
 const KEYRING_USER:    &str = "poe_session";
 
+fn read_config_json(app: &tauri::AppHandle) -> serde_json::Value {
+    let Ok(dir) = app.path().app_data_dir() else { return serde_json::json!({}) };
+    std::fs::read_to_string(dir.join("config.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
+fn write_config_json(app: &tauri::AppHandle, config: &serde_json::Value) {
+    let Ok(dir) = app.path().app_data_dir() else { return };
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join("config.json"), config.to_string());
+}
+
 fn save_session_config(app: &tauri::AppHandle, name: &str, value: &str) {
-    // Store the token value in the OS keyring (KWallet on KDE).
-    // Only fall back to config.json if the keyring is unavailable.
     let keyring_ok = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)
         .and_then(|e| e.set_password(value))
         .map_err(|e| eprintln!("[EW] keyring write failed: {e} — falling back to config.json"))
         .is_ok();
 
-    if let Ok(dir) = app.path().app_data_dir() {
-        let _ = std::fs::create_dir_all(&dir);
-        let n = serde_json::to_string(name).unwrap_or_default();
-        // Only write the value to disk if the keyring is unavailable
-        let json = if keyring_ok {
-            format!("{{\"cookie_name\":{n}}}")
-        } else {
-            let v = serde_json::to_string(value).unwrap_or_default();
-            format!("{{\"cookie_name\":{n},\"cookie_value\":{v}}}")
-        };
-        let _ = std::fs::write(dir.join("config.json"), json);
+    let mut config = read_config_json(app);
+    config["cookie_name"] = serde_json::json!(name);
+    if keyring_ok {
+        if let Some(obj) = config.as_object_mut() { obj.remove("cookie_value"); }
+    } else {
+        config["cookie_value"] = serde_json::json!(value);
     }
+    write_config_json(app, &config);
+}
+
+fn save_keybind_config(app: &tauri::AppHandle, code: &str) {
+    let mut config = read_config_json(app);
+    config["keybind"] = serde_json::json!(code);
+    write_config_json(app, &config);
+}
+
+fn save_monitor_pref_config(app: &tauri::AppHandle, index: i32) {
+    let mut config = read_config_json(app);
+    config["monitor_index"] = serde_json::json!(index);
+    write_config_json(app, &config);
 }
 
 #[tauri::command]
@@ -210,6 +243,22 @@ async fn fetch_leagues(
         .await
         .map_err(|e| format!("parse: {e}"))
         .map(|r| r.result)
+}
+
+#[tauri::command]
+fn get_keybind(state: tauri::State<KeybindCode>) -> String {
+    state.0.lock().unwrap().clone()
+}
+
+#[tauri::command]
+fn set_keybind(state: tauri::State<KeybindCode>, app: tauri::AppHandle, code: String) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    if code_to_evdev_key(&code).is_none() {
+        return Err(format!("Unsupported key code: {code}"));
+    }
+    *state.0.lock().unwrap() = code.clone();
+    save_keybind_config(&app, &code);
+    Ok(())
 }
 
 // ── Clipboard + item parsing ──────────────────────────────────────────────────
@@ -811,16 +860,35 @@ fn detect_poe_game() -> &'static str {
 
 // ── Layer-shell setup ─────────────────────────────────────────────────────────
 
+// Window dimensions must match tauri.conf.json so centering math is correct.
+const WIN_W: i32 = 450;
+const WIN_H: i32 = 850;
+
 #[cfg(target_os = "linux")]
-fn monitor_size_at_cursor() -> Option<(i32, i32)> {
+fn gdk_monitor_at_cursor() -> Option<gdk::Monitor> {
     use gdk::prelude::*;
     let display = gdk::Display::default()?;
-    let seat = display.default_seat()?;
+    let seat    = display.default_seat()?;
     let pointer = seat.pointer()?;
     let (_screen, px, py) = pointer.position();
-    let monitor = display.monitor_at_point(px, py)?;
-    let geo = monitor.geometry();
-    Some((geo.width(), geo.height()))
+    display.monitor_at_point(px, py)
+}
+
+// Picks the monitor with the largest pixel area — usually the main gaming screen.
+#[cfg(target_os = "linux")]
+fn largest_gdk_monitor() -> Option<gdk::Monitor> {
+    use gdk::prelude::MonitorExt;
+    let display = gdk::Display::default()?;
+    let n = display.n_monitors();
+    (0..n)
+        .filter_map(|i| display.monitor(i))
+        .max_by_key(|m| { let g = m.geometry(); g.width() * g.height() })
+}
+
+#[cfg(target_os = "linux")]
+fn primary_gdk_monitor() -> Option<gdk::Monitor> {
+    let display = gdk::Display::default()?;
+    display.primary_monitor().or_else(|| display.monitor(0))
 }
 
 #[cfg(target_os = "linux")]
@@ -828,7 +896,10 @@ fn init_layer_shell(
     window: &tauri::WebviewWindow<impl tauri::Runtime>,
     saved_x: i32,
     saved_y: i32,
+    for_setup: bool,
+    monitor_pref: i32, // -1 = auto heuristic, >= 0 = explicit GDK monitor index
 ) -> (i32, i32) {
+    use gdk::prelude::MonitorExt;
     use gtk_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
     let Ok(gtk_win) = window.gtk_window() else { return (saved_x, saved_y) };
 
@@ -839,13 +910,27 @@ fn init_layer_shell(
     gtk_win.set_anchor(Edge::Top, true);
     gtk_win.set_anchor(Edge::Left, true);
 
-    const W: i32 = 500;
-    const H: i32 = 680;
-    let (x, y) = if saved_x > 0 || saved_y > 0 {
+    let (x, y) = if for_setup {
+        // Setup screen: use the user's saved monitor preference if available,
+        // otherwise fall back to cursor → largest → GDK primary.
+        let monitor = if monitor_pref >= 0 {
+            gdk::Display::default().and_then(|d| d.monitor(monitor_pref))
+        } else {
+            gdk_monitor_at_cursor()
+                .or_else(largest_gdk_monitor)
+                .or_else(primary_gdk_monitor)
+        };
+        if let Some(ref m) = monitor { gtk_win.set_monitor(m); }
+        let geo = monitor.map(|m| { let g = m.geometry(); (g.width(), g.height()) })
+            .unwrap_or((1920, 1080));
+        (((geo.0 - WIN_W) / 2).max(0), ((geo.1 - WIN_H) / 2).max(0))
+    } else if saved_x > 0 || saved_y > 0 {
+        // Returning user: restore saved position. Monitor is pinned at show time
+        // inside on_alt_d using the explicit preference or cursor position.
         (saved_x, saved_y)
     } else {
-        let (mw, mh) = monitor_size_at_cursor().unwrap_or((3440, 1440));
-        (((mw - W) / 2).max(0), ((mh - H) / 2).max(0))
+        // First run: start at origin. on_alt_d centres on the right monitor first show.
+        (0, 0)
     };
 
     gtk_win.set_layer_shell_margin(Edge::Left, x);
@@ -856,19 +941,45 @@ fn init_layer_shell(
 // ── evdev listener ────────────────────────────────────────────────────────────
 
 #[cfg(target_os = "linux")]
+fn code_to_evdev_key(code: &str) -> Option<evdev::Key> {
+    use evdev::Key;
+    match code {
+        "KeyA" => Some(Key::KEY_A), "KeyB" => Some(Key::KEY_B),
+        "KeyC" => Some(Key::KEY_C), "KeyD" => Some(Key::KEY_D),
+        "KeyE" => Some(Key::KEY_E), "KeyF" => Some(Key::KEY_F),
+        "KeyG" => Some(Key::KEY_G), "KeyH" => Some(Key::KEY_H),
+        "KeyI" => Some(Key::KEY_I), "KeyJ" => Some(Key::KEY_J),
+        "KeyK" => Some(Key::KEY_K), "KeyL" => Some(Key::KEY_L),
+        "KeyM" => Some(Key::KEY_M), "KeyN" => Some(Key::KEY_N),
+        "KeyO" => Some(Key::KEY_O), "KeyP" => Some(Key::KEY_P),
+        "KeyQ" => Some(Key::KEY_Q), "KeyR" => Some(Key::KEY_R),
+        "KeyS" => Some(Key::KEY_S), "KeyT" => Some(Key::KEY_T),
+        "KeyU" => Some(Key::KEY_U), "KeyV" => Some(Key::KEY_V),
+        "KeyW" => Some(Key::KEY_W), "KeyX" => Some(Key::KEY_X),
+        "KeyY" => Some(Key::KEY_Y), "KeyZ" => Some(Key::KEY_Z),
+        "Backquote" => Some(Key::KEY_GRAVE),
+        "F1"  => Some(Key::KEY_F1),  "F2"  => Some(Key::KEY_F2),
+        "F3"  => Some(Key::KEY_F3),  "F4"  => Some(Key::KEY_F4),
+        "F5"  => Some(Key::KEY_F5),  "F6"  => Some(Key::KEY_F6),
+        "F7"  => Some(Key::KEY_F7),  "F8"  => Some(Key::KEY_F8),
+        "F9"  => Some(Key::KEY_F9),  "F10" => Some(Key::KEY_F10),
+        "F11" => Some(Key::KEY_F11), "F12" => Some(Key::KEY_F12),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn start_evdev_listener(handle: tauri::AppHandle) {
     use evdev::{InputEventKind, Key};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    let keybind_arc = handle.state::<KeybindCode>().0.clone();
+
     let keyboards: Vec<_> = evdev::enumerate()
         .filter_map(|(_, d)| {
             let supported = d.supported_keys()?;
-            if supported.contains(Key::KEY_D) && supported.contains(Key::KEY_LEFTALT) {
-                Some(d)
-            } else {
-                None
-            }
+            if supported.contains(Key::KEY_LEFTALT) { Some(d) } else { None }
         })
         .collect();
 
@@ -881,6 +992,7 @@ fn start_evdev_listener(handle: tauri::AppHandle) {
     for device in keyboards {
         let handle = handle.clone();
         let in_flight = in_flight.clone();
+        let keybind_arc = keybind_arc.clone();
         tauri::async_runtime::spawn(async move {
             let mut stream = match device.into_event_stream() {
                 Ok(s) => s,
@@ -918,22 +1030,24 @@ fn start_evdev_listener(handle: tauri::AppHandle) {
                             }
                         }
                     }
-                    Key::KEY_D if event.value() == 1 && alt_held => {
-                        if let Some(w) = handle.get_webview_window("main") {
-                            if w.is_visible().unwrap_or(false) {
-                                eprintln!("[EW {}] Alt+D — hiding overlay", ts());
-                                let _ = w.clone().run_on_main_thread(move || {
-                                    use gtk_layer_shell::{KeyboardMode, LayerShell};
-                                    if let Ok(gtk_win) = w.gtk_window() {
-                                        // Release keyboard grab while surface is still
-                                        // mapped so KWin returns focus to PoE2.
-                                        gtk_win.set_keyboard_mode(KeyboardMode::None);
-                                    }
-                                    let _ = w.hide();
-                                });
-                            } else {
-                                eprintln!("[EW {}] Alt+D — queuing search", ts());
-                                pending_search = true;
+                    k if event.value() == 1 && alt_held => {
+                        let trigger = code_to_evdev_key(&keybind_arc.lock().unwrap())
+                            .unwrap_or(Key::KEY_D);
+                        if k == trigger {
+                            if let Some(w) = handle.get_webview_window("main") {
+                                if w.is_visible().unwrap_or(false) {
+                                    eprintln!("[EW {}] hotkey — hiding overlay", ts());
+                                    let _ = w.clone().run_on_main_thread(move || {
+                                        use gtk_layer_shell::{KeyboardMode, LayerShell};
+                                        if let Ok(gtk_win) = w.gtk_window() {
+                                            gtk_win.set_keyboard_mode(KeyboardMode::None);
+                                        }
+                                        let _ = w.hide();
+                                    });
+                                } else {
+                                    eprintln!("[EW {}] hotkey — queuing search", ts());
+                                    pending_search = true;
+                                }
                             }
                         }
                     }
@@ -983,7 +1097,46 @@ async fn on_alt_d(handle: &tauri::AppHandle) {
     // 3. Show the overlay — Ctrl+C is already in flight.
     eprintln!("[EW {}] showing overlay", ts());
     let win = window.clone();
+    let app_for_show = handle.clone();
+    let monitor_pref = *handle.state::<MonitorPref>().0.lock().unwrap();
     let _ = window.clone().run_on_main_thread(move || {
+        #[cfg(target_os = "linux")]
+        {
+            use gdk::prelude::MonitorExt;
+            use gtk_layer_shell::{Edge, LayerShell};
+            if let Ok(gtk_win) = win.gtk_window() {
+                // Explicit user preference beats cursor detection; cursor beats nothing.
+                let monitor = if monitor_pref >= 0 {
+                    gdk::Display::default().and_then(|d| {
+                        eprintln!("[EW] using explicit monitor index {}", monitor_pref);
+                        d.monitor(monitor_pref)
+                    })
+                } else {
+                    let m = gdk_monitor_at_cursor();
+                    if let Some(ref mon) = m {
+                        let g = mon.geometry();
+                        eprintln!("[EW] cursor monitor: {}x{} at ({},{})", g.width(), g.height(), g.x(), g.y());
+                    }
+                    m
+                };
+                if let Some(ref m) = monitor {
+                    gtk_win.set_monitor(m);
+                }
+                // First-ever show (no saved position): centre on the chosen monitor.
+                let overlay_state = app_for_show.state::<OverlayPos>();
+                let pos = *overlay_state.0.lock().unwrap();
+                if pos == (0, 0) {
+                    if let Some(ref m) = monitor {
+                        let geo = m.geometry();
+                        let cx = ((geo.width()  - WIN_W) / 2).max(0);
+                        let cy = ((geo.height() - WIN_H) / 2).max(0);
+                        *overlay_state.0.lock().unwrap() = (cx, cy);
+                        gtk_win.set_layer_shell_margin(Edge::Left, cx);
+                        gtk_win.set_layer_shell_margin(Edge::Top, cy);
+                    }
+                }
+            }
+        }
         // Stay at KeyboardMode::None — prevents WebKit from grabbing focus and
         // intercepting the uinput Ctrl+C that's already in flight to PoE2.
         // The frontend switches to OnDemand via set_overlay_keyboard when the
@@ -1104,6 +1257,90 @@ fn load_saved_position(app: &tauri::App) -> (i32, i32) {
     let Ok(json) = std::fs::read_to_string(dir.join("position.json")) else { return (0, 0) };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) else { return (0, 0) };
     (v["x"].as_i64().unwrap_or(0) as i32, v["y"].as_i64().unwrap_or(0) as i32)
+}
+
+fn load_saved_keybind(app: &tauri::App) -> String {
+    let Ok(dir) = app.path().app_data_dir() else { return "KeyD".to_string() };
+    std::fs::read_to_string(dir.join("config.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v["keybind"].as_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| "KeyD".to_string())
+}
+
+fn load_saved_monitor_pref(app: &tauri::App) -> i32 {
+    let Ok(dir) = app.path().app_data_dir() else { return -1 };
+    std::fs::read_to_string(dir.join("config.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v["monitor_index"].as_i64())
+        .map(|n| n as i32)
+        .unwrap_or(-1)
+}
+
+fn load_setup_complete(app: &tauri::App) -> bool {
+    let Ok(dir) = app.path().app_data_dir() else { return false };
+    std::fs::read_to_string(dir.join("config.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v["setup_complete"].as_bool())
+        .unwrap_or(false)
+}
+
+#[tauri::command]
+fn is_setup_needed(app: tauri::AppHandle) -> bool {
+    let config = read_config_json(&app);
+    !config["setup_complete"].as_bool().unwrap_or(false)
+}
+
+#[tauri::command]
+fn complete_setup(app: tauri::AppHandle) {
+    let mut config = read_config_json(&app);
+    config["setup_complete"] = serde_json::json!(true);
+    write_config_json(&app, &config);
+}
+
+#[tauri::command]
+fn get_monitor_pref(state: tauri::State<MonitorPref>) -> i32 {
+    *state.0.lock().unwrap()
+}
+
+#[tauri::command]
+fn set_monitor_pref(index: i32, state: tauri::State<MonitorPref>, app: tauri::AppHandle) {
+    *state.0.lock().unwrap() = index;
+    save_monitor_pref_config(&app, index);
+}
+
+// Returns the list of GDK monitors with their geometry so the frontend can
+// show a picker. Must run GDK calls on the GTK main thread.
+#[tauri::command]
+fn list_monitors(app: tauri::AppHandle) -> Vec<MonitorInfo> {
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<MonitorInfo>>();
+    let _ = app.run_on_main_thread(move || {
+        #[cfg(target_os = "linux")]
+        {
+            use gdk::prelude::MonitorExt;
+            if let Some(display) = gdk::Display::default() {
+                let n = display.n_monitors();
+                eprintln!("[EW] list_monitors: GDK sees {} monitor(s)", n);
+                let list: Vec<MonitorInfo> = (0..n)
+                    .filter_map(|i| {
+                        let m = display.monitor(i)?;
+                        let g = m.geometry();
+                        let name = m.model()
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| format!("Display {}", i));
+                        eprintln!("[EW]   monitor {}: {} {}x{} at ({},{})", i, name, g.width(), g.height(), g.x(), g.y());
+                        Some(MonitorInfo { index: i, name, width: g.width(), height: g.height(), x: g.x(), y: g.y() })
+                    })
+                    .collect();
+                let _ = tx.send(list);
+                return;
+            }
+        }
+        let _ = tx.send(vec![]);
+    });
+    rx.recv().unwrap_or_default()
 }
 
 // ── Firefox session detection ─────────────────────────────────────────────────
@@ -1612,13 +1849,18 @@ pub fn run() {
         .setup(|app| {
             let saved = load_saved_position(app);
             let (sname, svalue) = load_saved_config(app);
+            let saved_keybind = load_saved_keybind(app);
+            let saved_monitor_pref = load_saved_monitor_pref(app);
+            let setup_complete = load_setup_complete(app);
             app.manage(PoeSession(Mutex::new((sname, svalue))));
             app.manage(StatCache(Mutex::new(std::collections::HashMap::new())));
+            app.manage(KeybindCode(std::sync::Arc::new(Mutex::new(saved_keybind))));
+            app.manage(MonitorPref(Mutex::new(saved_monitor_pref)));
 
             if let Some(window) = app.get_webview_window("main") {
                 #[cfg(target_os = "linux")]
                 {
-                    let (x, y) = init_layer_shell(&window, saved.0, saved.1);
+                    let (x, y) = init_layer_shell(&window, saved.0, saved.1, !setup_complete, saved_monitor_pref);
                     *app.state::<OverlayPos>().0.lock().unwrap() = (x, y);
                 }
                 #[cfg(not(target_os = "linux"))]
@@ -1627,6 +1869,12 @@ pub fn run() {
 
             #[cfg(target_os = "linux")]
             start_evdev_listener(app.handle().clone());
+
+            if !setup_complete {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                }
+            }
 
             #[cfg(not(target_os = "linux"))]
             {
@@ -1654,6 +1902,13 @@ pub fn run() {
             read_browser_session,
             fetch_leagues,
             trade_search,
+            get_keybind,
+            set_keybind,
+            is_setup_needed,
+            complete_setup,
+            list_monitors,
+            get_monitor_pref,
+            set_monitor_pref,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

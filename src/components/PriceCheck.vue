@@ -109,9 +109,57 @@ const sessionIsSet     = ref(false)
 const detectStatus     = ref<'idle' | 'busy' | 'ok' | 'err'>('idle')
 const detectError      = ref('')
 
+const keybind          = ref('KeyD')
+const capturingKeybind = ref(false)
+let   captureHandler: ((e: KeyboardEvent) => void) | null = null
+
+interface MonitorInfo { index: number; name: string; width: number; height: number; x: number; y: number }
+const monitors     = ref<MonitorInfo[]>([])
+const monitorPref  = ref(-1)
+
+async function loadMonitors() {
+  monitors.value  = await invoke<MonitorInfo[]>('list_monitors')
+  monitorPref.value = await invoke<number>('get_monitor_pref')
+}
+async function pickMonitor(index: number) {
+  monitorPref.value = index
+  await invoke('set_monitor_pref', { index })
+}
+
+function displayKeybind(code: string): string {
+  if (code.startsWith('Key')) return 'Alt + ' + code.slice(3)
+  if (code === 'Backquote') return 'Alt + `'
+  return 'Alt + ' + code
+}
+
+function stopKeybindCapture() {
+  capturingKeybind.value = false
+  invoke('set_overlay_keyboard', { enabled: false })
+  if (captureHandler) {
+    document.removeEventListener('keydown', captureHandler)
+    captureHandler = null
+  }
+}
+
+function startKeybindCapture() {
+  capturingKeybind.value = true
+  invoke('set_overlay_keyboard', { enabled: true })
+  captureHandler = (e: KeyboardEvent) => {
+    e.preventDefault()
+    if (['Alt', 'Control', 'Shift', 'Meta'].includes(e.key)) return
+    if (e.key === 'Escape') { stopKeybindCapture(); return }
+    const code = e.code
+    invoke<void>('set_keybind', { code })
+      .then(() => { keybind.value = code })
+      .catch(err => console.error('set_keybind:', err))
+    stopKeybindCapture()
+  }
+  document.addEventListener('keydown', captureHandler)
+}
+
 function toggleSettings() {
   showSettings.value = !showSettings.value
-  if (showSettings.value) detectStatus.value = 'idle'
+  if (showSettings.value) { detectStatus.value = 'idle'; loadMonitors() }
   handleInteract()
 }
 
@@ -310,22 +358,17 @@ let isDragging = false
 function startDrag(e: MouseEvent) {
   if (e.button !== 0) return
   isDragging = true
-  document.documentElement.requestPointerLock()
   emit('interact')
 }
 function onDragMove(e: MouseEvent) {
-  if (!isDragging || !document.pointerLockElement) return
+  if (!isDragging) return
   const dx = Math.round(e.movementX), dy = Math.round(e.movementY)
   if (dx !== 0 || dy !== 0) invoke('move_overlay', { dx, dy })
 }
 function stopDrag() {
-  if (isDragging && document.pointerLockElement) document.exitPointerLock()
-}
-function onPointerLockChange() {
-  if (!document.pointerLockElement && isDragging) {
-    isDragging = false
-    invoke('save_overlay_position')
-  }
+  if (!isDragging) return
+  isDragging = false
+  invoke('save_overlay_position')
 }
 
 // ── Lifecycle ────────────────────────────────────────────────────────────────
@@ -334,9 +377,11 @@ const unlisteners: UnlistenFn[] = []
 onMounted(async () => {
   document.addEventListener('mousemove', onDragMove)
   document.addEventListener('mouseup', stopDrag)
-  document.addEventListener('pointerlockchange', onPointerLockChange)
 
   loadLeagues()
+
+  invoke<string>('get_keybind').then(code => { keybind.value = code })
+  loadMonitors()
 
   invoke<string>('get_session_id').then(async id => {
     if (id) {
@@ -411,8 +456,8 @@ onMounted(async () => {
 onUnmounted(() => {
   document.removeEventListener('mousemove', onDragMove)
   document.removeEventListener('mouseup', stopDrag)
-  document.removeEventListener('pointerlockchange', onPointerLockChange)
   unlisteners.forEach(fn => fn())
+  stopKeybindCapture()
 })
 
 async function openTradeSite() {
@@ -457,6 +502,34 @@ async function openTradeSite() {
     <template v-if="showSettings">
       <div class="settings-panel">
         <div class="section">
+          <div class="section-title">HOTKEY</div>
+          <div class="keybind-row">
+            <span class="keybind-display">{{ displayKeybind(keybind) }}</span>
+            <button
+              :class="['action-btn', capturingKeybind ? 'primary' : 'secondary', 'keybind-btn']"
+              @click.stop="capturingKeybind ? stopKeybindCapture() : startKeybindCapture()"
+            >{{ capturingKeybind ? 'Press a key… (Esc to cancel)' : 'Change' }}</button>
+          </div>
+          <p class="settings-hint">Press Alt + this key to show the overlay. Avoid W/A/S/D if using WASD movement.</p>
+        </div>
+
+        <div class="section" v-if="monitors.length > 1">
+          <div class="section-title">SCREEN</div>
+          <div class="monitor-list">
+            <button
+              v-for="m in monitors"
+              :key="m.index"
+              :class="['monitor-btn', monitorPref === m.index ? 'monitor-active' : '']"
+              @click.stop="pickMonitor(m.index)"
+            >
+              <span class="monitor-name">{{ m.name }}</span>
+              <span class="monitor-res">{{ m.width }}×{{ m.height }}</span>
+            </button>
+          </div>
+          <p class="settings-hint">Select the screen where Path of Exile runs. Restart the app after changing this.</p>
+        </div>
+
+      <div class="section">
           <div class="section-title">SESSION COOKIE</div>
 
           <div :class="['session-status', sessionIsSet ? 'status-ok' : 'status-warn']">
@@ -859,6 +932,26 @@ async function openTradeSite() {
   flex-direction: column;
   overflow: hidden;
 }
+.keybind-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.keybind-display {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--accent);
+  font-family: monospace;
+  letter-spacing: 0.04em;
+}
+.keybind-btn {
+  flex-shrink: 0;
+  padding: 5px 10px;
+  font-size: 11px;
+}
+
 .settings-hint {
   font-size: 11px;
   color: var(--text-muted);
@@ -866,6 +959,34 @@ async function openTradeSite() {
   margin-bottom: 10px;
 }
 .settings-hint strong { color: var(--text-label); }
+.monitor-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+.monitor-btn {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 7px 10px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.15s;
+  text-align: left;
+}
+.monitor-btn:hover { border-color: var(--accent-dim); color: var(--text); }
+.monitor-active {
+  border-color: var(--accent) !important;
+  color: var(--accent) !important;
+  background: rgba(200,168,75,0.08) !important;
+}
+.monitor-name { font-weight: 600; }
+.monitor-res  { font-size: 10px; opacity: 0.7; }
 .session-input {
   width: 100%;
   padding: 6px 8px;
